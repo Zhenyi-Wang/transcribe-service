@@ -6,9 +6,15 @@ import gc
 import torch
 import json
 import re
+import uuid
+from pathlib import Path
 from fastapi import FastAPI, UploadFile, File
 from funasr import AutoModel
 from config import config
+
+# 减少FunASR的冗余日志输出
+os.environ['MODELSCOPE_CACHE'] = '/home/zhenyi/.cache/modelscope'
+os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'  # 禁用进度条
 
 def detect_language_from_result(result):
     """从FunASR结果中提取语言信息"""
@@ -71,6 +77,7 @@ class ModelManager:
                     print("如果是第一次运行，正在自动从 ModelScope 下载模型，请耐心等待...")
                     
                     try:
+                        print(f"[{time.strftime('%H:%M:%S')}] 注意：可能显示'Downloading Model'但实际上使用缓存...")
                         self.model = AutoModel(
                             model=config.model_name,
                             vad_model=config.vad_model,
@@ -108,6 +115,33 @@ class ModelManager:
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
+def generate_safe_filename(filename: str) -> str:
+    """生成安全的临时文件名"""
+    if not filename:
+        filename = "audio"
+
+    # 获取文件扩展名
+    ext = Path(filename).suffix.lower()
+    if not ext:
+        ext = ".tmp"  # 默认扩展名
+
+    # 限制扩展名到常见音频格式
+    allowed_exts = {'.wav', '.mp3', '.m4a', '.flac', '.aac', '.ogg', '.wma'}
+    if ext not in allowed_exts:
+        ext = '.tmp'
+
+    # 使用UUID + 时间戳确保唯一性
+    unique_id = str(uuid.uuid4())[:8]
+    timestamp = int(time.time())
+
+    return f"temp_{timestamp}_{unique_id}{ext}"
+
+def get_temp_dir():
+    """获取并创建临时目录"""
+    temp_dir = Path("tmp")
+    temp_dir.mkdir(exist_ok=True)
+    return temp_dir
 
 manager = ModelManager()
 
@@ -191,8 +225,9 @@ async def transcribe_audio(file: UploadFile = File(...)):
             "version": config.subtitle_config["version"]
         }
 
-    # 2. 存临时文件
-    temp_filename = f"temp_{int(time.time())}_{file.filename}"
+    # 2. 存临时文件（使用安全的文件名生成）
+    temp_dir = get_temp_dir()
+    temp_filename = temp_dir / generate_safe_filename(file.filename)
     with open(temp_filename, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
@@ -201,7 +236,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
         # 3. 推理 (FunASR 内部会自动调用 ffmpeg 读取音频)
         res = asr_model.generate(
-            input=temp_filename,
+            input=str(temp_filename),  # 转换为字符串路径
             batch_size_s=config.batch_size_s,
             disable_pbar=True
         )
@@ -246,12 +281,28 @@ async def transcribe_audio(file: UploadFile = File(...)):
             "body": []
         }
     finally:
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
+        # 确保清理临时文件
+        try:
+            if os.path.exists(temp_filename):
+                os.remove(temp_filename)
+        except Exception as e:
+            print(f"[{time.strftime('%H:%M:%S')}] 警告：临时文件删除失败 {temp_filename}: {e}")
 
 if __name__ == "__main__":
     import uvicorn
+
+    # 预加载模型，避免第一次请求延迟
+    print(f"[{time.strftime('%H:%M:%S')}] 启动时预加载模型...")
+    print("注意：第一次运行时仍需要从 ModelScope 下载模型，请耐心等待...")
+    try:
+        manager.load_model_if_needed()
+        print(f"[{time.strftime('%H:%M:%S')}] 预加载完成，服务器已就绪！")
+    except Exception as e:
+        print(f"[{time.strftime('%H:%M:%S')}] 警告：预加载失败 - {e}")
+        print("服务器将继续启动，将在首次请求时重试加载模型")
+
     # 从配置获取API配置
     api_config = config.api_config
+    print(f"[{time.strftime('%H:%M:%S')}] 启动服务器 http://{api_config['host']}:{api_config['port']}")
     uvicorn.run(app, host=api_config["host"], port=api_config["port"])
     

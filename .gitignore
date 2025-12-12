@@ -103,6 +103,7 @@ dmypy.json
 temp_*
 *.tmp
 *.log
+tmp/
 
 # OS generated files
 .DS_Store
