@@ -1,0 +1,21 @@
+# 核心 AI 框架
+# 注意：PyTorch需要根据你的CUDA版本手动安装
+# 请参考README.md中的安装说明
+
+# torch
+# torchvision
+# torchaudio
+
+# 语音识别业务依赖
+funasr
+modelscope
+# 限制 numpy 版本以防止与旧版 torch 冲突（可选，但推荐）
+numpy
+
+# Web 服务依赖
+fastapi
+uvicorn
+python-multipart
+
+# 配置文件依赖
+PyYAML

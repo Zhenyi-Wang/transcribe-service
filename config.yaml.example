@@ -1,0 +1,36 @@
+# 音频转录服务配置文件
+# 复制此文件为 config.yaml 并根据需要修改配置
+
+# 服务器配置
+server:
+  idle_timeout: 300      # 5分钟无请求自动释放模型（秒）
+  check_interval: 10     # 模型状态检查间隔（秒）
+
+# 模型配置
+model:
+  name: "paraformer-zh"  # 核心识别模型
+  vad_model: "fsmn-vad"  # VAD模型（语音活动检测）
+  punc_model: "ct-punc"  # 标点符号模型
+  disable_update: true   # 禁用每次启动时的模型更新检查
+
+# 处理配置
+processing:
+  batch_size_s: 300                     # 批处理大小（秒）
+  max_segment_length: 20                # 字幕最大长度（字符数）
+  duration_per_segment: 3.0             # 每段字幕持续时间（秒）
+  chinese_ratio_threshold: 0.3          # 中文比例阈值
+
+# 字幕样式配置
+subtitle:
+  font_size: 0.4
+  font_color: "#FFFFFF"
+  background_alpha: 0.5
+  background_color: "#9C27B0"
+  stroke: "none"
+  type: "manual_transcribe"
+  version: "v1"
+
+# API配置
+api:
+  host: "0.0.0.0"  # 监听地址
+  port: 8000       # 监听端口
