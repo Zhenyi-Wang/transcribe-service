@@ -105,6 +105,9 @@ temp_*
 *.log
 tmp/
 
+# Logs directory
+logs/
+
 # OS generated files
 .DS_Store
 .DS_Store?

@@ -7,6 +7,7 @@ import torch
 import json
 import re
 import uuid
+import logging
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -16,8 +17,41 @@ from funasr import AutoModel
 from config import config
 
 # 减少FunASR的冗余日志输出
-os.environ['MODELSCOPE_CACHE'] = '/home/zhenyi/.cache/modelscope'
+os.environ['MODELSCOPE_CACHE'] = str(Path.home() / ".cache/modelscope")
 os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'  # 禁用进度条
+
+# 配置logger
+log_dir = Path("logs")
+log_dir.mkdir(exist_ok=True)
+
+# 创建不缓冲的文件处理器
+class UnbufferedFileHandler(logging.FileHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.stream.flush()
+
+file_handler = UnbufferedFileHandler(log_dir / "server.log", encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+
+# 创建控制台处理器
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+
+# 设置格式
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# 配置根日志记录器
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# 添加处理器
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+# 防止日志重复
+logger.propagate = False
 
 def detect_language_from_result(result):
     """从FunASR结果中提取语言信息"""
@@ -58,7 +92,7 @@ def detect_language_from_result(result):
             return "zh"  # 默认中文
 
     except Exception as e:
-        print(f"语言检测失败: {e}")
+        logger.error(f"语言检测失败: {e}")
         return "zh"
 
 class ModelManager:
@@ -89,7 +123,7 @@ class ModelManager:
         if config.enable_timestamp:
             # 使用句子级别时间戳，更适合字幕生成
             model_kwargs["sentence_timestamp"] = True
-            print(f"[{time.strftime('%H:%M:%S')}] 已启用句子级时间戳")
+            logger.info("已启用句子级时间戳")
 
         return model_kwargs
 
@@ -101,23 +135,23 @@ class ModelManager:
                 if self.model is None:
                     # 优先尝试 GPU
                     target_device = "cuda" if torch.cuda.is_available() else "cpu"
-                    print(f"[{time.strftime('%H:%M:%S')}] 正在加载模型 (Target: {target_device})...")
-                    print("如果是第一次运行，正在自动从 ModelScope 下载模型，请耐心等待...")
-                    
+                    logger.info(f"正在加载模型 (Target: {target_device})...")
+                    logger.info("如果是第一次运行，正在自动从 ModelScope 下载模型，请耐心等待...")
+
                     try:
-                        print(f"[{time.strftime('%H:%M:%S')}] 注意：可能显示'Downloading Model'但实际上使用缓存...")
+                        logger.info("注意：可能显示'Downloading Model'但实际上使用缓存...")
 
                         # 构建模型参数
                         model_kwargs = self._build_model_kwargs(target_device)
 
                         self.model = AutoModel(**model_kwargs)
                         self.device = target_device
-                        print(f"[{time.strftime('%H:%M:%S')}] 模型加载成功！运行在: {self.device}")
+                        logger.info(f"模型加载成功！运行在: {self.device}")
                         
                     except Exception as e:
                         # 如果是显存炸了(OOM)，切回 CPU 重试
                         if "out of memory" in str(e).lower() and target_device == "cuda":
-                            print(f"⚠️ 显存不足，正在切换回 CPU 模式...")
+                            logger.warning("显存不足，正在切换回 CPU 模式...")
                             torch.cuda.empty_cache()
 
                             # 构建CPU模式的模型参数
@@ -125,7 +159,7 @@ class ModelManager:
 
                             self.model = AutoModel(**model_kwargs)
                             self.device = "cpu"
-                            print(f"CPU 模式加载成功。")
+                            logger.info("CPU 模式加载成功。")
                         else:
                             # 其他错误（如下载失败）直接抛出
                             raise e
@@ -134,7 +168,7 @@ class ModelManager:
     def unload_model(self):
         with self.lock:
             if self.model is not None:
-                print(f"[{time.strftime('%H:%M:%S')}] 闲置超时，释放模型资源...")
+                logger.info("闲置超时，释放模型资源...")
                 del self.model
                 self.model = None
                 gc.collect()
@@ -304,7 +338,7 @@ app = FastAPI()
 
 # Token验证中间件
 @app.middleware("http")
-async def token_validation_middleware(request: Request, call_next):
+def token_validation_middleware(request: Request, call_next):
     # 如果配置了token，则进行验证
     if config.api_token:
         # 获取Authorization头
@@ -337,7 +371,7 @@ async def token_validation_middleware(request: Request, call_next):
             )
 
     # 继续处理请求
-    response = await call_next(request)
+    response = call_next(request)
     return response
 
 @app.post("/transcribe")
@@ -360,7 +394,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, buffer)
 
     try:
-        print(f"[{time.strftime('%H:%M:%S')}] 开始识别: {file.filename}")
+        logger.info(f"开始识别: {file.filename}")
 
         # 3. 推理 (FunASR 内部会自动调用 ffmpeg 读取音频)
         res = asr_model.generate(
@@ -377,11 +411,11 @@ async def transcribe_audio(file: UploadFile = File(...)):
 
         # 如果启用了时间戳，打印关键信息
         if config.enable_timestamp and res and "sentence_info" in res[0]:
-            print(f"[{time.strftime('%H:%M:%S')}] 检测到 {len(res[0]['sentence_info'])} 个句子")
+            logger.info(f"检测到 {len(res[0]['sentence_info'])} 个句子")
 
         # 检测语言
         detected_lang = detect_language_from_result(res)
-        print(f"[{time.strftime('%H:%M:%S')}] 检测到语言: {detected_lang}")
+        logger.info(f"检测到语言: {detected_lang}")
 
         # 生成字幕格式（传递ASR结果以获取真实时间戳）
         subtitle_body = generate_subtitle_segments(transcript_text, res)
@@ -418,23 +452,23 @@ async def transcribe_audio(file: UploadFile = File(...)):
             if os.path.exists(temp_filename):
                 os.remove(temp_filename)
         except Exception as e:
-            print(f"[{time.strftime('%H:%M:%S')}] 警告：临时文件删除失败 {temp_filename}: {e}")
+            logger.warning(f"警告：临时文件删除失败 {temp_filename}: {e}")
 
 if __name__ == "__main__":
     import uvicorn
 
     # 预加载模型，避免第一次请求延迟
-    print(f"[{time.strftime('%H:%M:%S')}] 启动时预加载模型...")
-    print("注意：第一次运行时仍需要从 ModelScope 下载模型，请耐心等待...")
+    logger.info("启动时预加载模型...")
+    logger.info("注意：第一次运行时仍需要从 ModelScope 下载模型，请耐心等待...")
     try:
         manager.load_model_if_needed()
-        print(f"[{time.strftime('%H:%M:%S')}] 预加载完成，服务器已就绪！")
+        logger.info("预加载完成，服务器已就绪！")
     except Exception as e:
-        print(f"[{time.strftime('%H:%M:%S')}] 警告：预加载失败 - {e}")
-        print("服务器将继续启动，将在首次请求时重试加载模型")
+        logger.warning(f"警告：预加载失败 - {e}")
+        logger.info("服务器将继续启动，将在首次请求时重试加载模型")
 
     # 从配置获取API配置
     api_config = config.api_config
-    print(f"[{time.strftime('%H:%M:%S')}] 启动服务器 http://{api_config['host']}:{api_config['port']}")
+    logger.info(f"启动服务器 http://{api_config['host']}:{api_config['port']}")
     uvicorn.run(app, host=api_config["host"], port=api_config["port"])
     
