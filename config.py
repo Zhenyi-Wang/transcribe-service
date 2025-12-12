@@ -82,6 +82,11 @@ class Config:
         return self.get('processing.duration_per_segment', 3.0)
 
     @property
+    def enable_timestamp(self) -> bool:
+        """是否启用时间戳"""
+        return self.get('processing.enable_timestamp', True)
+
+    @property
     def chinese_ratio_threshold(self) -> float:
         """中文比例阈值"""
         return self.get('processing.chinese_ratio_threshold', 0.3)

@@ -68,6 +68,31 @@ class ModelManager:
         self.last_active_time = 0
         self.device = "cpu"
 
+    def _build_model_kwargs(self, device: str) -> dict:
+        """构建模型参数，GPU和CPU共享
+
+        Args:
+            device: 设备类型 ('cuda' 或 'cpu')
+
+        Returns:
+            dict: 模型参数字典
+        """
+        model_kwargs = {
+            "model": config.model_name,
+            "vad_model": config.vad_model,
+            "punc_model": config.punc_model,
+            "device": device,
+            "disable_update": config.disable_update  # 禁止每次都去检查更新，加快加载速度
+        }
+
+        # 如果启用时间戳，添加相应参数
+        if config.enable_timestamp:
+            # 使用句子级别时间戳，更适合字幕生成
+            model_kwargs["sentence_timestamp"] = True
+            print(f"[{time.strftime('%H:%M:%S')}] 已启用句子级时间戳")
+
+        return model_kwargs
+
     def load_model_if_needed(self):
         self.last_active_time = time.time()
         
@@ -81,13 +106,11 @@ class ModelManager:
                     
                     try:
                         print(f"[{time.strftime('%H:%M:%S')}] 注意：可能显示'Downloading Model'但实际上使用缓存...")
-                        self.model = AutoModel(
-                            model=config.model_name,
-                            vad_model=config.vad_model,
-                            punc_model=config.punc_model,
-                            device=target_device,
-                            disable_update=config.disable_update # 禁止每次都去检查更新，加快加载速度
-                        )
+
+                        # 构建模型参数
+                        model_kwargs = self._build_model_kwargs(target_device)
+
+                        self.model = AutoModel(**model_kwargs)
                         self.device = target_device
                         print(f"[{time.strftime('%H:%M:%S')}] 模型加载成功！运行在: {self.device}")
                         
@@ -96,12 +119,11 @@ class ModelManager:
                         if "out of memory" in str(e).lower() and target_device == "cuda":
                             print(f"⚠️ 显存不足，正在切换回 CPU 模式...")
                             torch.cuda.empty_cache()
-                            self.model = AutoModel(
-                                model=config.model_name,
-                                vad_model=config.vad_model,
-                                punc_model=config.punc_model,
-                                device="cpu"
-                            )
+
+                            # 构建CPU模式的模型参数
+                            model_kwargs = self._build_model_kwargs("cpu")
+
+                            self.model = AutoModel(**model_kwargs)
                             self.device = "cpu"
                             print(f"CPU 模式加载成功。")
                         else:
@@ -192,8 +214,73 @@ def split_text_into_segments(text, max_length=None):
 
     return segments
 
-def generate_subtitle_segments(text):
-    """生成带时间戳的字幕段落"""
+def generate_subtitle_segments(text, asr_result=None):
+    """生成带时间戳的字幕段落
+
+    Args:
+        text: 转录文本
+        asr_result: ASR原始结果（包含时间戳信息）
+    """
+    # 如果启用时间戳且ASR结果包含时间戳信息
+    if config.enable_timestamp and asr_result and len(asr_result) > 0:
+        # 尝试从ASR结果中提取时间戳
+        result = asr_result[0]
+        body = []
+
+        # FunASR sentence_timestamp=True 时返回 sentence_info
+        if "sentence_info" in result:
+            sentence_info = result["sentence_info"]
+            if isinstance(sentence_info, list):
+                for i, seg in enumerate(sentence_info):
+                    if isinstance(seg, dict) and "text" in seg:
+                        # 获取句子文本和时间戳
+                        sentence_text = seg["text"]
+                        start_ms = seg.get("start", 0)
+                        end_ms = seg.get("end", start_ms)
+
+                        # 转换毫秒为秒
+                        start_time = float(start_ms) / 1000
+                        end_time = float(end_ms) / 1000
+
+                        if sentence_text.strip():
+                            body.append({
+                                "from": round(start_time, 2),
+                                "to": round(end_time, 2),
+                                "sid": i + 1,
+                                "location": 2,
+                                "content": sentence_text.strip(),
+                                "music": 0
+                            })
+
+                if body:  # 如果成功提取了时间戳
+                    return body
+
+        # 2. 尝试其他可能的时间戳字段
+        timestamp_fields = ["segments", "sentences", "words", "timestamp_detail", "time_stamps"]
+        for field in timestamp_fields:
+            if field in result:
+                segments = result[field]
+                if isinstance(segments, list):
+                    for i, seg in enumerate(segments):
+                        if isinstance(seg, dict):
+                            start_time = seg.get("start", seg.get("begin", 0))
+                            end_time = seg.get("end", seg.get("finish", start_time + config.duration_per_segment))
+                            text_seg = seg.get("text", seg.get("word", seg.get("txt", "")))
+
+                            if text_seg.strip():
+                                body.append({
+                                    "from": round(start_time, 2),
+                                    "to": round(end_time, 2),
+                                    "sid": i + 1,
+                                    "location": 2,
+                                    "content": text_seg.strip(),
+                                    "music": 0
+                                })
+
+                    if body:
+                        return body
+
+    # 如果没有时间戳信息或禁用了时间戳，使用原始逻辑
     segments = split_text_into_segments(text)
     body = []
 
@@ -288,12 +375,16 @@ async def transcribe_audio(file: UploadFile = File(...)):
         # 获取转录文本
         transcript_text = res[0]["text"] if res else ""
 
+        # 如果启用了时间戳，打印关键信息
+        if config.enable_timestamp and res and "sentence_info" in res[0]:
+            print(f"[{time.strftime('%H:%M:%S')}] 检测到 {len(res[0]['sentence_info'])} 个句子")
+
         # 检测语言
         detected_lang = detect_language_from_result(res)
         print(f"[{time.strftime('%H:%M:%S')}] 检测到语言: {detected_lang}")
 
-        # 生成字幕格式
-        subtitle_body = generate_subtitle_segments(transcript_text)
+        # 生成字幕格式（传递ASR结果以获取真实时间戳）
+        subtitle_body = generate_subtitle_segments(transcript_text, res)
 
         # 从配置获取字幕样式
         subtitle_config = config.subtitle_config

@@ -127,6 +127,7 @@ test/*.mp3
 test/*.m4a
 test/*.flac
 test/*.ogg
+test/*
 
 # Config files (keep only the example)
 config.yaml
