@@ -106,8 +106,14 @@ class Config:
         """API配置"""
         return self.get('api', {
             "host": "0.0.0.0",
-            "port": 8000
+            "port": 8000,
+            "token": ""
         })
+
+    @property
+    def api_token(self) -> str:
+        """API访问令牌"""
+        return self.get('api.token', "")
 
 # 全局配置实例
 config = Config()

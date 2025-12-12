@@ -34,3 +34,4 @@ subtitle:
 api:
   host: "0.0.0.0"  # 监听地址
   port: 8000       # 监听端口
+  token: ""         # API访问令牌，空表示不需要验证

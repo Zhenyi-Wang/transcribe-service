@@ -8,7 +8,10 @@ import json
 import re
 import uuid
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware import Middleware
+from fastapi.middleware.cors import CORSMiddleware
 from funasr import AutoModel
 from config import config
 
@@ -211,6 +214,44 @@ def generate_subtitle_segments(text):
 
 # ================= API 接口 =================
 app = FastAPI()
+
+# Token验证中间件
+@app.middleware("http")
+async def token_validation_middleware(request: Request, call_next):
+    # 如果配置了token，则进行验证
+    if config.api_token:
+        # 获取Authorization头
+        authorization = request.headers.get("Authorization")
+
+        if not authorization:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Missing Authorization header"},
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+
+        # 验证Bearer token格式
+        if not authorization.startswith("Bearer "):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid authorization format. Expected: Bearer <token>"},
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+
+        # 提取token
+        token = authorization.split(" ", 1)[1]
+
+        # 验证token是否匹配
+        if token != config.api_token:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Invalid token"},
+                headers={"WWW-Authenticate": "Bearer"}
+            )
+
+    # 继续处理请求
+    response = await call_next(request)
+    return response
 
 @app.post("/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):

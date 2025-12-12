@@ -9,6 +9,7 @@
 - ⚡ GPU/CPU 自适应，显存不足自动降级
 - 🎬 返回 B 站字幕格式的 JSON 数据
 - 🔄 自动资源管理，闲置释放模型
+- 🔒 可选的 API 访问令牌认证
 
 ## 快速开始
 
@@ -139,6 +140,7 @@ conda env create -f environment.yml
    api:
      host: "0.0.0.0"
      port: 8000
+     token: ""         # API访问令牌，空表示不需要验证
    ```
 
 ### 运行服务
@@ -161,6 +163,9 @@ bash run.sh
 
 **请求参数：**
 - `file`: 音频文件（multipart/form-data）
+
+**请求头（可选）：**
+- `Authorization`: Bearer token（如果配置了token则需要）
 
 **响应格式：**
 
@@ -218,7 +223,34 @@ import requests
 # 上传音频文件
 with open('audio.mp3', 'rb') as f:
     files = {'file': f}
-    response = requests.post('http://localhost:8000/transcribe', files=files)
+    headers = {}
+
+    # 如果配置了token，添加Authorization头
+    # headers['Authorization'] = 'Bearer your_token_here'
+
+    response = requests.post('http://localhost:8000/transcribe', files=files, headers=headers)
+
+result = response.json()
+print(f"检测语言: {result['lang']}")
+for subtitle in result['body']:
+    print(f"{subtitle['from']:.1f}s - {subtitle['to']:.1f}s: {subtitle['content']}")
+```
+
+### 带 Token 认证的 Python 客户端
+
+```python
+import requests
+
+# 配置token
+token = "your_token_here"
+headers = {
+    'Authorization': f'Bearer {token}'
+}
+
+# 上传音频文件
+with open('audio.mp3', 'rb') as f:
+    files = {'file': f}
+    response = requests.post('http://localhost:8000/transcribe', files=files, headers=headers)
 
 result = response.json()
 print(f"检测语言: {result['lang']}")
@@ -232,6 +264,16 @@ for subtitle in result['body']:
 curl -X POST "http://localhost:8000/transcribe" \
      -H "accept: application/json" \
      -H "Content-Type: multipart/form-data" \
+     -F "file=@audio.mp3"
+```
+
+### 带 Token 认证的 cURL 示例
+
+```bash
+curl -X POST "http://localhost:8000/transcribe" \
+     -H "accept: application/json" \
+     -H "Content-Type: multipart/form-data" \
+     -H "Authorization: Bearer your_token_here" \
      -F "file=@audio.mp3"
 ```
 
@@ -283,7 +325,15 @@ subtitle:
 api:
   host: "0.0.0.0"  # 监听地址
   port: 8000       # 监听端口
+  token: ""        # API访问令牌，空表示不需要验证
 ```
+
+**API配置说明：**
+- `host`: 服务器监听的IP地址，0.0.0.0表示监听所有网络接口
+- `port`: 服务器监听的端口号
+- `token`: API访问令牌，用于客户端认证
+  - 留空（默认）：不需要认证，任何人都可以访问API
+  - 设置值：客户端需要在请求头中添加`Authorization: Bearer <token>`才能访问
 
 ## 语言支持
 
