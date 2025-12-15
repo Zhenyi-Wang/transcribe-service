@@ -19,7 +19,7 @@ class BilibiliDownloader:
         }
 
     def get_audio_url(self, bvid: str, cookie: str) -> Optional[Tuple[str, dict]]:
-        """从页面源码获取B站音频URL（最低音质）"""
+        """从页面源码获取B站音频URL（支持新旧两种格式）"""
         try:
             video_url = f"https://www.bilibili.com/video/{bvid}"
 
@@ -41,8 +41,9 @@ class BilibiliDownloader:
 
             playinfo_data = json.loads(playinfo_match.group(1))
 
-            # 提取音频URL，选择最低音质
+            # 新版格式：dash分离音视频
             if 'data' in playinfo_data and 'dash' in playinfo_data['data'] and 'audio' in playinfo_data['data']['dash']:
+                logger.info("使用新版格式（dash）获取音频")
                 audio_list = playinfo_data['data']['dash']['audio']
                 # 按比特率排序，选择最低音质（文件最小）
                 audio_list_sorted = sorted(audio_list, key=lambda x: x['bandwidth'])
@@ -52,7 +53,8 @@ class BilibiliDownloader:
                     'url': audio['baseUrl'],
                     'id': audio['id'],
                     'bandwidth': audio['bandwidth'],
-                    'codecs': audio['codecs']
+                    'codecs': audio['codecs'],
+                    'format': 'dash'  # 标记为dash格式
                 }
 
                 logger.info(f"找到音频信息 - ID: {audio_info['id']}, "
@@ -60,8 +62,28 @@ class BilibiliDownloader:
                           f"编码: {audio_info['codecs']}")
 
                 return audio_info['url'], audio_info
+
+            # 旧版格式：durl混合音视频
+            elif 'data' in playinfo_data and 'durl' in playinfo_data['data']:
+                logger.info("使用旧版格式（durl）获取音视频")
+                durl = playinfo_data['data']['durl']
+                if isinstance(durl, list) and len(durl) > 0 and 'url' in durl[0]:
+                    audio_info = {
+                        'url': durl[0]['url'],
+                        'id': 'video_audio',
+                        'bandwidth': 0,  # 旧版格式没有比特率信息
+                        'codecs': 'h264+aac',  # 假设编码格式
+                        'format': 'durl'  # 标记为durl格式
+                    }
+
+                    logger.info(f"找到音视频流 - 注意：这是视频+音频的混合流")
+
+                    return audio_info['url'], audio_info
+                else:
+                    logger.error("durl 数据格式不正确")
+                    return None
             else:
-                logger.error("无法从 playinfo 数据中提取音频信息")
+                logger.error("无法从 playinfo 数据中提取音频信息，既没有 dash 也没有 durl")
                 return None
 
         except Exception as e:
@@ -109,7 +131,7 @@ class BilibiliDownloader:
     def download_bilibili_audio(self, bvid: str, cookie: str, save_dir: str = "tmp") -> Tuple[bool, str]:
         """下载B站音频的完整流程"""
         try:
-            # 1. 获取音频URL（从页面源码，选择最低音质）
+            # 1. 获取音频URL（从页面源码，支持新旧格式）
             logger.info(f"获取音频URL: bvid={bvid}")
             result = self.get_audio_url(bvid, cookie)
 
@@ -117,12 +139,19 @@ class BilibiliDownloader:
                 return False, "无法获取音频URL"
 
             audio_url, audio_info = result
-            logger.info(f"音频ID: {audio_info['id']}, 比特率: {audio_info['bandwidth']/1000:.1f} kbps")
+
+            # 根据格式类型选择不同的文件扩展名
+            if audio_info.get('format') == 'durl':
+                logger.info(f"音频格式: 旧版durl（音视频混合流）")
+                ext = '.mp4'
+            else:
+                logger.info(f"音频ID: {audio_info['id']}, 比特率: {audio_info['bandwidth']/1000:.1f} kbps")
+                ext = '.m4s'
 
             # 2. 准备保存路径
             Path(save_dir).mkdir(exist_ok=True)
             # 使用BVID和音频ID作为文件名
-            filename = f"{bvid}_audio_{audio_info['id']}.m4s"
+            filename = f"{bvid}_audio_{audio_info['id']}{ext}"
             filepath = os.path.join(save_dir, filename)
 
             # 3. 下载文件
