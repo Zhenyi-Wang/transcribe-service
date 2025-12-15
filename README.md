@@ -10,6 +10,7 @@
 - 🎬 返回 B 站字幕格式的 JSON 数据
 - 🔄 自动资源管理，闲置释放模型
 - 🔒 可选的 API 访问令牌认证
+- 📹 支持B站视频音频直接转录（通过BV号和CID）
 
 ## 快速开始
 
@@ -167,6 +168,32 @@ bash run.sh
 **请求头（可选）：**
 - `Authorization`: Bearer token（如果配置了token则需要）
 
+### POST /transcribe_url
+
+直接转录B站视频音频（无需下载上传）。
+
+**请求参数：**
+```json
+{
+  "bvid": "BV1kHm3B9ET8",     // B站视频BV号
+  "cid": "34671824111",       // 视频CID
+  "cookie": "your_cookie"    // B站Cookie（用于身份验证）
+}
+```
+
+**请求头（可选）：**
+- `Authorization`: Bearer token（如果配置了token则需要）
+
+**获取B站视频CID的方法：**
+1. 使用B站API：`https://api.bilibili.com/x/web-interface/view?bvid={BV号}`
+2. 解析返回的JSON中的 `data.cid` 字段
+3. 或使用浏览器开发者工具查看网页源码
+
+**注意事项：**
+- 需要有效的B站Cookie才能下载音频
+- Cookie会过期，需要定期更新
+- 音频文件会下载到服务器临时目录，转录完成后自动清理
+
 **响应格式：**
 
 ```json
@@ -277,6 +304,76 @@ curl -X POST "http://localhost:8000/transcribe" \
      -F "file=@audio.mp3"
 ```
 
+### 使用 /transcribe_url 接口转录B站视频
+
+#### Python 示例
+
+```python
+import requests
+import json
+
+# 配置信息
+bvid = "BV1kHm3B9ET8"  # 视频BV号
+cookie = "你的B站Cookie"  # 从浏览器获取的Cookie
+
+# 获取视频信息
+def get_video_info(bvid):
+    url = f"https://api.bilibili.com/x/web-interface/view?bvid={bvid}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Cookie": cookie
+    }
+    response = requests.get(url, headers=headers)
+    data = response.json()
+    return data['data']['title'], data['data']['cid']
+
+# 获取视频标题和CID
+title, cid = get_video_info(bvid)
+print(f"视频标题: {title}")
+print(f"CID: {cid}")
+
+# 调用转录接口
+transcribe_url = "http://localhost:8000/transcribe_url"
+headers = {
+    "Content-Type": "application/json"
+    # 如果配置了token，添加Authorization头
+    # "Authorization": "Bearer your_token_here"
+}
+
+payload = {
+    "bvid": bvid,
+    "cid": cid,
+    "cookie": cookie
+}
+
+response = requests.post(transcribe_url, headers=headers, json=payload)
+result = response.json()
+
+if result['status'] == 'success':
+    print(f"检测语言: {result['lang']}")
+    for subtitle in result['body']:
+        print(f"{subtitle['from']:.1f}s - {subtitle['to']:.1f}s: {subtitle['content']}")
+else:
+    print(f"转录失败: {result['message']}")
+```
+
+#### cURL 示例
+
+```bash
+# 1. 先获取视频信息（获取CID）
+curl -H "Cookie: 你的B站Cookie" \
+     "https://api.bilibili.com/x/web-interface/view?bvid=BV1kHm3B9ET8"
+
+# 2. 调用转录接口
+curl -X POST "http://localhost:8000/transcribe_url" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "bvid": "BV1kHm3B9ET8",
+       "cid": "34671824111",
+       "cookie": "你的B站Cookie"
+     }'
+```
+
 ## 配置说明
 
 ### 配置文件结构
@@ -350,13 +447,16 @@ api:
 transcribe-service/
 ├── server.py              # 主服务文件
 ├── config.py              # 配置管理模块
+├── transcribe.py          # 转录服务模块
+├── downloader.py          # B站音频下载模块
 ├── config.yaml.example    # 配置文件模板
 ├── config.yaml           # 实际配置文件（需要从模板复制，已被git忽略）
 ├── requirements.txt       # Python依赖
 ├── run.sh               # 启动脚本
 ├── .gitignore           # Git忽略文件
-├── test/               # 测试目录
-│   └── test.mp3       # 测试音频文件
+├── test/                # 测试目录
+│   ├── test.mp3        # 测试音频文件
+│   └── test.py         # B站下载测试脚本
 └── README.md           # 项目说明
 ```
 
