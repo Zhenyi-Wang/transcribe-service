@@ -254,11 +254,10 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
     temp_filename = None
     try:
         # 1. 下载音频文件到tmp目录
-        logger.info(f"开始下载B站音频: bvid={request.bvid}, cid={request.cid}")
+        logger.info(f"开始下载B站音频: bvid={request.bvid}")
 
         success, result = downloader.download_bilibili_audio(
             request.bvid,
-            request.cid,
             request.cookie,
             save_dir=str(get_temp_dir())
         )
@@ -277,7 +276,7 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
 
         # 2. 使用转录服务处理
         # 使用更友好的文件名用于日志显示
-        display_name = f"Bilibili_{request.bvid}_{request.cid}"
+        display_name = f"Bilibili_{request.bvid}"
         result = await transcription_service.process_transcription(temp_filename, display_name)
 
         return result
