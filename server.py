@@ -268,7 +268,8 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
                 "message": f"音频下载失败: {result}",
                 "type": config.subtitle_config["type"],
                 "version": config.subtitle_config["version"],
-                "body": []
+                "body": [],
+                "rtf": 0.0
             }
 
         temp_filename = result  # result是文件路径

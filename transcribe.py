@@ -1,8 +1,72 @@
 import time
 import logging
+import os
+import subprocess
+from pathlib import Path
 from config import config
 
 logger = logging.getLogger(__name__)
+
+def get_audio_duration(file_path: str) -> float:
+    """获取音频文件的时长（秒）
+
+    Args:
+        file_path: 音频文件路径
+
+    Returns:
+        float: 音频时长（秒），如果获取失败返回0.0
+    """
+    try:
+        # 方法1：尝试使用ffprobe（ffmpeg工具）
+        if os.system("which ffprobe > /dev/null 2>&1") == 0:
+            cmd = [
+                'ffprobe', '-v', 'quiet', '-show_entries',
+                'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1',
+                file_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                duration = float(result.stdout.strip())
+                if duration > 0:
+                    return duration
+
+        # 方法2：使用mutagen库（如果有安装）
+        try:
+            from mutagen import File
+            audio_file = File(file_path)
+            if audio_file is not None and hasattr(audio_file, 'info'):
+                duration = audio_file.info.length
+                if duration > 0:
+                    return duration
+        except ImportError:
+            pass
+
+        # 方法3：尝试使用torchaudio（如果有安装）
+        try:
+            import torchaudio
+            waveform, sample_rate = torchaudio.load(file_path)
+            duration = waveform.shape[1] / sample_rate
+            if duration > 0:
+                return duration
+        except ImportError:
+            pass
+
+        # 方法4：对于WAV文件，使用wave模块
+        if file_path.lower().endswith('.wav'):
+            import wave
+            with wave.open(file_path, 'rb') as wav_file:
+                frames = wav_file.getnframes()
+                sample_rate = wav_file.getframerate()
+                duration = frames / sample_rate
+                if duration > 0:
+                    return duration
+
+        logger.warning(f"无法获取音频时长: {file_path}")
+        return 0.0
+
+    except Exception as e:
+        logger.error(f"获取音频时长失败: {e}")
+        return 0.0
 
 def detect_language_from_result(result):
     """从FunASR结果中提取语言信息"""
@@ -190,17 +254,31 @@ class TranscriptionService:
             # 1. 触发懒加载
             asr_model = self.model_manager.load_model_if_needed()
         except Exception as e:
+            # 获取音频时长
+            audio_duration = get_audio_duration(audio_file_path)
             return {
                 "status": "error",
                 "message": f"Model load failed: {str(e)}",
                 "type": config.subtitle_config["type"],
-                "version": config.subtitle_config["version"]
+                "version": config.subtitle_config["version"],
+                "audio_duration": round(audio_duration, 2),
+                "processing_time": 0.0,
+                "rtf": 0.0
             }
 
         try:
-            # 2. 转录
+            # 2. 获取音频时长
             filename_to_log = original_filename or audio_file_path
+            audio_duration = get_audio_duration(audio_file_path)
+            if audio_duration > 0:
+                logger.info(f"音频时长: {audio_duration:.2f}秒")
+            else:
+                logger.warning("无法获取音频时长")
+
             logger.info(f"开始识别: {filename_to_log}")
+
+            # 记录转录开始时间，计算纯粹的转换时间（处理时长）
+            transcription_start_time = time.time()
 
             res = asr_model.generate(
                 input=audio_file_path,
@@ -208,11 +286,22 @@ class TranscriptionService:
                 disable_pbar=True
             )
 
+            # 计算处理时长（纯粹的转换时间）
+            processing_time = time.time() - transcription_start_time
+
             # 刷新活跃时间
             self.model_manager.last_active_time = time.time()
 
             # 获取转录文本
             transcript_text = res[0]["text"] if res else ""
+
+            # 计算RTF比值（处理时长/音频时长）
+            rtf_ratio = 0.0
+            if audio_duration > 0:
+                rtf_ratio = processing_time / audio_duration
+
+            # 记录所有指标到日志
+            logger.info(f"转录完成 - 处理时长: {processing_time:.2f}秒, RTF比值: {rtf_ratio:.2f}")
 
             # 如果启用了时间戳，打印关键信息
             if config.enable_timestamp and res and "sentence_info" in res[0]:
@@ -239,16 +328,41 @@ class TranscriptionService:
                 "version": subtitle_config["version"],
                 "body": subtitle_body,
                 "device_used": self.model_manager.device,
+                "audio_duration": round(audio_duration, 2),
+                "processing_time": round(processing_time, 2),
+                "rtf": round(rtf_ratio, 2),
                 "status": "success"
             }
 
         except Exception as e:
             if "out of memory" in str(e).lower():
                 self.model_manager.unload_model()  # 遇到错误赶紧释放资源
+
+            # 获取音频时长（如果还没有获取）
+            audio_duration = 0.0
+            if 'audio_duration' in locals():
+                audio_duration = locals()['audio_duration']
+            else:
+                audio_duration = get_audio_duration(audio_file_path)
+
+            # 如果在转录过程中出错，尝试计算部分处理时间
+            processing_time = 0.0
+            rtf_ratio = 0.0
+            if 'transcription_start_time' in locals():
+                processing_time = time.time() - locals()['transcription_start_time']
+                if audio_duration > 0:
+                    rtf_ratio = processing_time / audio_duration
+                logger.warning(f"转录过程中出错 - 部分处理时长: {processing_time:.2f}秒, RTF比值: {rtf_ratio:.2f}")
+
+            logger.error(f"转录失败: {str(e)}")
+
             return {
                 "status": "error",
                 "message": str(e),
                 "type": config.subtitle_config["type"],
                 "version": config.subtitle_config["version"],
-                "body": []
+                "body": [],
+                "audio_duration": round(audio_duration, 2),
+                "processing_time": round(processing_time, 2),
+                "rtf": round(rtf_ratio, 2)
             }
