@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 from config import config
 from logger_config import setup_logger
+from cache_manager import cache_manager
 
 logger = setup_logger(__name__)
 
@@ -260,17 +261,36 @@ class TranscriptionService:
     def __init__(self, model_manager):
         self.model_manager = model_manager
 
-    async def process_transcription(self, audio_file_path: str, original_filename: str = None):
+    async def process_transcription(self, audio_file_path: str, original_filename: str = None, audio_url: str = None, bvid: str = None, audio_id: str = None):
         """
         处理音频转录的主函数
 
         Args:
             audio_file_path: 音频文件的路径
             original_filename: 原始文件名（用于日志）
+            audio_url: 音频URL（用于缓存，可选）
+            bvid: B站视频ID（用于缓存，可选）
+            audio_id: 音频ID（用于缓存，可选）
 
         Returns:
             dict: 转录结果
         """
+        # 检查转录缓存
+        if audio_id and bvid:
+            # 优先使用BVID+音频ID检查转录缓存
+            cached_result = cache_manager.get_cached_transcript(None, bvid, audio_id)
+            if cached_result:
+                cached_result.pop('cached_at', None)
+                logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
+                return cached_result
+        elif audio_url or bvid:
+            # 兼容旧方式
+            cached_result = cache_manager.get_cached_transcript(audio_url, bvid)
+            if cached_result:
+                cached_result.pop('cached_at', None)
+                logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
+                return cached_result
+
         try:
             # 1. 触发懒加载
             asr_model = self.model_manager.load_model_if_needed()
@@ -351,7 +371,7 @@ class TranscriptionService:
             # 从配置获取字幕样式
             subtitle_config = config.subtitle_config
 
-            return {
+            result = {
                 "font_size": subtitle_config["font_size"],
                 "font_color": subtitle_config["font_color"],
                 "background_alpha": subtitle_config["background_alpha"],
@@ -367,6 +387,16 @@ class TranscriptionService:
                 "rtf": round(rtf_ratio, 3),
                 "status": "success"
             }
+
+            # 保存到缓存
+            if audio_id and bvid:
+                # 优先使用BVID+音频ID保存
+                cache_manager.save_transcript_to_cache(None, result, bvid, audio_id)
+            elif audio_url or bvid:
+                # 兼容旧方式
+                cache_manager.save_transcript_to_cache(audio_url, result, bvid)
+
+            return result
 
         except Exception as e:
             if "out of memory" in str(e).lower():

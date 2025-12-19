@@ -17,6 +17,7 @@ from config import config
 from downloader import BilibiliDownloader
 from transcribe import TranscriptionService
 from logger_config import setup_logger
+from cache_manager import cache_manager
 from pydantic import BaseModel
 
 # 减少FunASR的冗余日志输出
@@ -140,7 +141,6 @@ transcription_service = TranscriptionService(manager)
 # 定义请求模型
 class BilibiliTranscribeRequest(BaseModel):
     bvid: str
-    cid: str
     cookie: str
 
 # ================= 后台保活线程 =================
@@ -156,6 +156,14 @@ bg_thread.start()
 
 # ================= API 接口 =================
 app = FastAPI()
+
+# 启动时清理过期缓存
+@app.on_event("startup")
+async def startup_event():
+    """应用启动时的事件处理"""
+    logger.info("服务启动中...")
+    cache_manager.cleanup_expired_cache()
+    logger.info("服务启动完成")
 
 # Token验证中间件
 @app.middleware("http")
@@ -242,24 +250,30 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
                 "rtf": 0.0
             }
 
-        temp_filename = result  # result是文件路径
+        temp_filename = result["file_path"]  # 从字典中获取文件路径
+        audio_url = result["audio_url"]  # 获取音频URL
+        audio_id = result.get("audio_id")  # 获取音频ID（可选）
         logger.info(f"音频下载完成: {temp_filename}")
 
         # 2. 使用转录服务处理
         # 使用更友好的文件名用于日志显示
         display_name = f"Bilibili_{request.bvid}"
-        result = await transcription_service.process_transcription(temp_filename, display_name)
+        result = await transcription_service.process_transcription(temp_filename, display_name, audio_url, request.bvid, audio_id)
 
         return result
 
     finally:
-        # 确保清理临时文件
+        # 确保清理临时文件（只清理tmp目录下的文件，不清理cache目录）
         if temp_filename and os.path.exists(temp_filename):
-            try:
-                os.remove(temp_filename)
-                logger.info(f"临时文件已删除: {temp_filename}")
-            except Exception as e:
-                logger.warning(f"警告：临时文件删除失败 {temp_filename}: {e}")
+            # 只有当文件在tmp目录下时才删除
+            if temp_filename.startswith("tmp/") or "/tmp/" in temp_filename:
+                try:
+                    os.remove(temp_filename)
+                    logger.info(f"临时文件已删除: {temp_filename}")
+                except Exception as e:
+                    logger.warning(f"警告：临时文件删除失败 {temp_filename}: {e}")
+            else:
+                logger.info(f"缓存文件保留: {temp_filename}")
 
 if __name__ == "__main__":
     import uvicorn

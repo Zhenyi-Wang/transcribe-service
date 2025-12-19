@@ -20,6 +20,12 @@ processing:
   duration_per_segment: 3.0             # 每段字幕持续时间（秒）
   chinese_ratio_threshold: 0.3          # 中文比例阈值
 
+# 缓存配置
+cache:
+  enabled: true        # 是否启用缓存
+  dir: cache          # 缓存目录
+  days: 7             # 缓存保存天数
+
 # 字幕样式配置
 subtitle:
   font_size: 0.4

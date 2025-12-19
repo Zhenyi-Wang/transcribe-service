@@ -120,5 +120,21 @@ class Config:
         """API访问令牌"""
         return self.get('api.token', "")
 
+    # 缓存配置
+    @property
+    def cache_enabled(self) -> bool:
+        """是否启用缓存"""
+        return self.get('cache.enabled', True)
+
+    @property
+    def cache_dir(self) -> str:
+        """缓存目录"""
+        return self.get('cache.dir', 'cache')
+
+    @property
+    def cache_days(self) -> int:
+        """缓存保存天数"""
+        return self.get('cache.days', 7)
+
 # 全局配置实例
 config = Config()
