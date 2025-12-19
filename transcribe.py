@@ -1,11 +1,11 @@
 import time
-import logging
 import os
 import subprocess
 from pathlib import Path
 from config import config
+from logger_config import setup_logger
 
-logger = logging.getLogger(__name__)
+logger = setup_logger(__name__)
 
 def get_audio_duration(file_path: str) -> float:
     """获取音频文件的时长（秒）
@@ -145,6 +145,27 @@ def split_text_into_segments(text, max_length=None):
         segments.append(current_segment.strip())
 
     return segments
+
+def format_duration(seconds: float) -> str:
+    """将秒数格式化为时分秒格式
+
+    Args:
+        seconds: 秒数
+
+    Returns:
+        str: 格式化后的时长字符串 (H:MM:SS 或 M:SS)
+    """
+    if seconds < 0:
+        return "0:00"
+
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+
+    if hours > 0:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    else:
+        return f"{minutes}:{secs:02d}"
 
 def generate_subtitle_segments(text, asr_result=None):
     """生成带时间戳的字幕段落
@@ -300,8 +321,21 @@ class TranscriptionService:
             if audio_duration > 0:
                 rtf_ratio = processing_time / audio_duration
 
+            # 控制台输出关键指标
+            logger.info(f"\n{'='*50}")
+            logger.info(f"转录完成!")
+            logger.info(f"{'='*50}")
+            logger.info(f"音频时长:     {format_duration(audio_duration)} ({audio_duration:.2f}秒)")
+            logger.info(f"处理时长:     {format_duration(processing_time)} ({processing_time:.2f}秒)")
+            logger.info(f"RTF比值:      {rtf_ratio:.3f}")
+            if rtf_ratio < 1:
+                logger.info(f"状态:         实时处理 ✅ (RTF < 1)")
+            else:
+                logger.info(f"状态:         非实时处理 ⏱️ (RTF ≥ 1)")
+            logger.info(f"{'='*50}\n")
+
             # 记录所有指标到日志
-            logger.info(f"转录完成 - 处理时长: {processing_time:.2f}秒, RTF比值: {rtf_ratio:.2f}")
+            logger.info(f"转录完成 - 处理时长: {processing_time:.2f}秒, RTF比值: {rtf_ratio:.3f}")
 
             # 如果启用了时间戳，打印关键信息
             if config.enable_timestamp and res and "sentence_info" in res[0]:
@@ -330,7 +364,7 @@ class TranscriptionService:
                 "device_used": self.model_manager.device,
                 "audio_duration": round(audio_duration, 2),
                 "processing_time": round(processing_time, 2),
-                "rtf": round(rtf_ratio, 2),
+                "rtf": round(rtf_ratio, 3),
                 "status": "success"
             }
 
@@ -352,7 +386,18 @@ class TranscriptionService:
                 processing_time = time.time() - locals()['transcription_start_time']
                 if audio_duration > 0:
                     rtf_ratio = processing_time / audio_duration
-                logger.warning(f"转录过程中出错 - 部分处理时长: {processing_time:.2f}秒, RTF比值: {rtf_ratio:.2f}")
+
+                # 控制台输出错误信息
+                logger.error(f"\n{'='*50}")
+                logger.error(f"转录失败!")
+                logger.error(f"{'='*50}")
+                logger.error(f"音频时长:     {format_duration(audio_duration)} ({audio_duration:.2f}秒)")
+                logger.error(f"处理时长:     {format_duration(processing_time)} ({processing_time:.2f}秒)")
+                logger.error(f"RTF比值:      {rtf_ratio:.3f}")
+                logger.error(f"错误信息:     {str(e)}")
+                logger.error(f"{'='*50}\n")
+
+                logger.warning(f"转录过程中出错 - 部分处理时长: {processing_time:.2f}秒, RTF比值: {rtf_ratio:.3f}")
 
             logger.error(f"转录失败: {str(e)}")
 
@@ -364,5 +409,5 @@ class TranscriptionService:
                 "body": [],
                 "audio_duration": round(audio_duration, 2),
                 "processing_time": round(processing_time, 2),
-                "rtf": round(rtf_ratio, 2)
+                "rtf": round(rtf_ratio, 3)
             }

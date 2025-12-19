@@ -3,11 +3,11 @@ import time
 import requests
 import json
 import re
-import logging
 from pathlib import Path
 from typing import Optional, Tuple
+from logger_config import setup_logger
 
-logger = logging.getLogger(__name__)
+logger = setup_logger('downloader')
 
 class BilibiliDownloader:
     """B站音频下载器"""
@@ -97,6 +97,7 @@ class BilibiliDownloader:
             headers["Cookie"] = cookie
 
             logger.info(f"开始下载: {filename}")
+            logger.info(f"实际下载URL: {audio_url}")
 
             response = requests.get(audio_url, headers=headers, stream=True)
             response.raise_for_status()

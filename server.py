@@ -7,7 +7,6 @@ import torch
 import json
 import re
 import uuid
-import logging
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -17,44 +16,15 @@ from funasr import AutoModel
 from config import config
 from downloader import BilibiliDownloader
 from transcribe import TranscriptionService
+from logger_config import setup_logger
 from pydantic import BaseModel
 
 # 减少FunASR的冗余日志输出
 os.environ['MODELSCOPE_CACHE'] = str(Path.home() / ".cache/modelscope")
 os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'  # 禁用进度条
 
-# 配置logger
-log_dir = Path("logs")
-log_dir.mkdir(exist_ok=True)
-
-# 创建不缓冲的文件处理器
-class UnbufferedFileHandler(logging.FileHandler):
-    def emit(self, record):
-        super().emit(record)
-        self.stream.flush()
-
-file_handler = UnbufferedFileHandler(log_dir / "server.log", encoding='utf-8')
-file_handler.setLevel(logging.INFO)
-
-# 创建控制台处理器
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-
-# 设置格式
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-file_handler.setFormatter(formatter)
-console_handler.setFormatter(formatter)
-
-# 配置根日志记录器
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-# 添加处理器
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
-
-# 防止日志重复
-logger.propagate = False
+# 使用统一的logger配置
+logger = setup_logger('server')
 
 class ModelManager:
     def __init__(self):
