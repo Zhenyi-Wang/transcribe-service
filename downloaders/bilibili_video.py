@@ -8,10 +8,11 @@ from typing import Optional, Tuple, Union
 from logger_config import setup_logger
 from cache_manager import cache_manager
 
-logger = setup_logger('downloader')
+logger = setup_logger('bilibili_video')
 
-class BilibiliDownloader:
-    """B站音频下载器"""
+
+class BilibiliVideoDownloader:
+    """B站视频（bvid格式）音频下载器"""
 
     def __init__(self):
         self.headers_template = {
@@ -146,11 +147,20 @@ class BilibiliDownloader:
             return audio_info
         return None
 
-    def download_bilibili_audio(self, bvid: str, cookie: str, save_dir: str = "tmp") -> Tuple[bool, Union[str, dict]]:
-        """下载B站音频的完整流程"""
+    def download(self, id: str, cookie: str, save_dir: str = "tmp") -> Tuple[bool, Union[str, dict]]:
+        """下载B站视频音频的完整流程
+
+        Args:
+            id: B站视频BVID
+            cookie: B站Cookie
+            save_dir: 保存目录
+
+        Returns:
+            (success, result) - 成功时返回文件信息字典，失败时返回错误信息字符串
+        """
         try:
             # 1. 首先获取音频信息（不包含URL）用于缓存检查
-            audio_info = self.get_audio_info(bvid, cookie)
+            audio_info = self.get_audio_info(id, cookie)
             if not audio_info:
                 return False, "无法获取音频信息"
 
@@ -161,19 +171,19 @@ class BilibiliDownloader:
                 ext = '.m4s'
 
             # 2. 先检查缓存（使用BVID+音频ID作为缓存键）
-            cached_file = cache_manager.get_cached_file(None, bvid, ext, str(audio_info['id']))
+            cached_file = cache_manager.get_cached_file(None, id, ext, str(audio_info['id']))
             if cached_file:
                 logger.info(f"使用缓存文件: {cached_file}")
                 # 返回缓存文件信息和音频ID
                 return True, {
                     "file_path": cached_file,
-                    "audio_url": f"cached://{bvid}_{audio_info['id']}",
+                    "audio_url": f"cached://{id}_{audio_info['id']}",
                     "audio_id": str(audio_info['id'])
                 }
 
             # 3. 如果没有缓存，获取完整的音频URL进行下载
-            logger.info(f"获取音频URL: bvid={bvid}")
-            result = self.get_audio_url(bvid, cookie)
+            logger.info(f"获取音频URL: bvid={id}")
+            result = self.get_audio_url(id, cookie)
 
             if not result:
                 return False, "无法获取音频URL"
@@ -185,18 +195,18 @@ class BilibiliDownloader:
             else:
                 logger.info(f"音频ID: {audio_info['id']}, 比特率: {audio_info['bandwidth']/1000:.1f} kbps")
 
-            # 3. 准备保存路径
+            # 4. 准备保存路径
             Path(save_dir).mkdir(exist_ok=True)
             # 使用BVID和音频ID作为文件名
-            filename = f"{bvid}_audio_{audio_info['id']}{ext}"
+            filename = f"{id}_audio_{audio_info['id']}{ext}"
             filepath = os.path.join(save_dir, filename)
 
-            # 4. 下载文件
+            # 5. 下载文件
             success, result = self.download_audio(audio_url, cookie, filepath)
 
             if success:
-                # 5. 保存到缓存（使用BVID+音频ID作为缓存键）
-                cached_path = cache_manager.save_to_cache(audio_url, result, bvid, str(audio_info['id']))
+                # 6. 保存到缓存（使用BVID+音频ID作为缓存键）
+                cached_path = cache_manager.save_to_cache(audio_url, result, id, str(audio_info['id']))
                 # 返回包含音频URL和音频ID的字典
                 return True, {
                     "file_path": cached_path,

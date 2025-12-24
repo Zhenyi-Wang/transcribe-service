@@ -14,7 +14,7 @@ from fastapi.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
 from funasr import AutoModel
 from config import config
-from downloader import BilibiliDownloader
+from downloaders import BilibiliDownloader
 from transcribe import TranscriptionService
 from logger_config import setup_logger
 from cache_manager import cache_manager
