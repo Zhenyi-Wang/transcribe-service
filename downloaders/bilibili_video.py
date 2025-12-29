@@ -29,7 +29,7 @@ class BilibiliVideoDownloader:
             extract_audio_info_only: 是否只提取音频信息（不获取URL）
         """
         try:
-            video_url = f"https://www.bilibili.com/video/{bvid}"
+            video_url = f"https://www.bilibili.com/video/{bvid}/"
 
             headers = self.headers_template.copy()
             headers["Cookie"] = cookie
