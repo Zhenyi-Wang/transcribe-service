@@ -12,7 +12,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
-from funasr import AutoModel
+
 from config import config
 from downloaders import BilibiliDownloader
 from transcribe import TranscriptionService
@@ -48,7 +48,8 @@ class ModelManager:
             "vad_model": config.vad_model,
             "punc_model": config.punc_model,
             "device": device,
-            "disable_update": config.disable_update  # 禁止每次都去检查更新，加快加载速度
+            "disable_update": config.disable_update,  # 禁止每次都去检查更新，加快加载速度
+            "trust_remote_code": True  # 新模型需要信任远程代码
         }
 
         # 如果启用时间戳，添加相应参数
@@ -76,6 +77,7 @@ class ModelManager:
                         # 构建模型参数
                         model_kwargs = self._build_model_kwargs(target_device)
 
+                        from funasr import AutoModel
                         self.model = AutoModel(**model_kwargs)
                         self.device = target_device
                         logger.info(f"模型加载成功！运行在: {self.device}")
@@ -89,6 +91,7 @@ class ModelManager:
                             # 构建CPU模式的模型参数
                             model_kwargs = self._build_model_kwargs("cpu")
 
+                            from funasr import AutoModel
                             self.model = AutoModel(**model_kwargs)
                             self.device = "cpu"
                             logger.info("CPU 模式加载成功。")
