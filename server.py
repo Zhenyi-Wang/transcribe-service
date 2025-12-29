@@ -145,6 +145,10 @@ transcription_service = TranscriptionService(manager)
 class BilibiliTranscribeRequest(BaseModel):
     bvid: str
     cookie: str
+    no_cache: bool = False
+
+    class Config:
+        populate_by_name = True
 
 # ================= 后台保活线程 =================
 def monitor_loop():
@@ -261,7 +265,7 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
         # 2. 使用转录服务处理
         # 使用更友好的文件名用于日志显示
         display_name = f"Bilibili_{request.bvid}"
-        result = await transcription_service.process_transcription(temp_filename, display_name, audio_url, request.bvid, audio_id)
+        result = await transcription_service.process_transcription(temp_filename, display_name, audio_url, request.bvid, audio_id, request.no_cache)
 
         return result
 

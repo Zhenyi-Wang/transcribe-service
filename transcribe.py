@@ -261,7 +261,7 @@ class TranscriptionService:
     def __init__(self, model_manager):
         self.model_manager = model_manager
 
-    async def process_transcription(self, audio_file_path: str, original_filename: str = None, audio_url: str = None, bvid: str = None, audio_id: str = None):
+    async def process_transcription(self, audio_file_path: str, original_filename: str = None, audio_url: str = None, bvid: str = None, audio_id: str = None, no_cache: bool = False):
         """
         处理音频转录的主函数
 
@@ -271,25 +271,27 @@ class TranscriptionService:
             audio_url: 音频URL（用于缓存，可选）
             bvid: B站视频ID（用于缓存，可选）
             audio_id: 音频ID（用于缓存，可选）
+            no_cache: 是否禁用缓存（默认False）
 
         Returns:
             dict: 转录结果
         """
-        # 检查转录缓存
-        if audio_id and bvid:
-            # 优先使用BVID+音频ID检查转录缓存
-            cached_result = cache_manager.get_cached_transcript(None, bvid, audio_id)
-            if cached_result:
-                cached_result.pop('cached_at', None)
-                logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
-                return cached_result
-        elif audio_url or bvid:
-            # 兼容旧方式
-            cached_result = cache_manager.get_cached_transcript(audio_url, bvid)
-            if cached_result:
-                cached_result.pop('cached_at', None)
-                logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
-                return cached_result
+        # 检查转录缓存（除非禁用缓存）
+        if not no_cache:
+            if audio_id and bvid:
+                # 优先使用BVID+音频ID检查转录缓存
+                cached_result = cache_manager.get_cached_transcript(None, bvid, audio_id)
+                if cached_result:
+                    cached_result.pop('cached_at', None)
+                    logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
+                    return cached_result
+            elif audio_url or bvid:
+                # 兼容旧方式
+                cached_result = cache_manager.get_cached_transcript(audio_url, bvid)
+                if cached_result:
+                    cached_result.pop('cached_at', None)
+                    logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
+                    return cached_result
 
         try:
             # 1. 触发懒加载
