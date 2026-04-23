@@ -2,12 +2,10 @@ import os
 import time
 import shutil
 import threading
-import gc
-import torch
-import json
-import re
 import uuid
 from pathlib import Path
+from typing import Optional
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware import Middleware
@@ -27,90 +25,44 @@ os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
 # 使用统一的logger配置
 logger = setup_logger('server')
 
+
 class ModelManager:
+    """模型管理器 - 使用 BackendFactory 创建后端"""
+
     def __init__(self):
-        self.model = None
+        self._backend = None
         self.lock = threading.Lock()
         self.last_active_time = 0
-        self.device = "cpu"
 
     def load_model_if_needed(self):
+        """按需加载模型"""
         self.last_active_time = time.time()
 
-        if self.model is None:
+        if self._backend is None:
             with self.lock:
-                if self.model is None:
-                    # 优先尝试 GPU
-                    target_device = "cuda:0" if torch.cuda.is_available() else "cpu"
-                    logger.info(f"正在加载模型 (Target: {target_device})...")
-                    logger.info("如果是第一次运行，正在自动从 HuggingFace 下载模型，请耐心等待...")
+                if self._backend is None:
+                    from backends import BackendFactory
+                    self._backend = BackendFactory.create(config)
+                    logger.info(f"正在加载后端: {self._backend.name}...")
+                    self._backend.load()
+                    logger.info(f"后端加载成功！设备: {self._backend.device}")
 
-                    try:
-                        from qwen_asr import Qwen3ASRModel
-
-                        dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float16
-
-                        # 构建模型参数
-                        forced_aligner_kwargs = None
-                        if config.forced_aligner:
-                            forced_aligner_kwargs = dict(
-                                dtype=dtype,
-                                device_map=target_device,
-                            )
-                            logger.info("已启用时间戳对齐模型")
-
-                        self.model = Qwen3ASRModel.from_pretrained(
-                            config.asr_model,
-                            dtype=dtype,
-                            device_map=target_device,
-                            max_new_tokens=config.max_new_tokens,
-                            forced_aligner=config.forced_aligner if config.forced_aligner else None,
-                            forced_aligner_kwargs=forced_aligner_kwargs,
-                        )
-                        self.device = target_device
-                        logger.info(f"模型加载成功！运行在: {self.device}")
-
-                    except Exception as e:
-                        # 如果是显存炸了(OOM)，切回 CPU 重试
-                        if "out of memory" in str(e).lower() and target_device.startswith("cuda"):
-                            logger.warning("显存不足，正在切换回 CPU 模式...")
-                            torch.cuda.empty_cache()
-
-                            from qwen_asr import Qwen3ASRModel
-
-                            dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float16
-
-                            forced_aligner_kwargs = None
-                            if config.forced_aligner:
-                                forced_aligner_kwargs = dict(
-                                    dtype=dtype,
-                                    device_map="cpu",
-                                )
-
-                            self.model = Qwen3ASRModel.from_pretrained(
-                                config.asr_model,
-                                dtype=dtype,
-                                device_map="cpu",
-                                max_new_tokens=config.max_new_tokens,
-                                forced_aligner=config.forced_aligner if config.forced_aligner else None,
-                                forced_aligner_kwargs=forced_aligner_kwargs,
-                            )
-                            self.device = "cpu"
-                            logger.info("CPU 模式加载成功。")
-                        else:
-                            # 其他错误直接抛出
-                            raise e
-        return self.model
+        return self._backend
 
     def unload_model(self):
+        """释放模型资源"""
         with self.lock:
-            if self.model is not None:
-                logger.info("闲置超时，释放模型资源...")
-                del self.model
-                self.model = None
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            if self._backend is not None:
+                logger.info(f"闲置超时，释放后端资源: {self._backend.name}...")
+                self._backend.unload()
+                self._backend = None
+
+    @property
+    def backend(self):
+        """获取当前后端名称"""
+        if self._backend:
+            return self._backend.name
+        return config.backend_name
 
 def generate_safe_filename(filename: str) -> str:
     """生成安全的临时文件名"""
@@ -139,6 +91,21 @@ def get_temp_dir():
     temp_dir.mkdir(exist_ok=True)
     return temp_dir
 
+
+def cleanup_stale_tmp_files(max_age_hours: int = 24):
+    """清理超过指定时间的 tmp 文件"""
+    temp_dir = Path("tmp")
+    if not temp_dir.exists():
+        return
+    cutoff = time.time() - max_age_hours * 3600
+    for f in temp_dir.iterdir():
+        if f.is_file() and f.stat().st_mtime < cutoff:
+            try:
+                f.unlink()
+                logger.info(f"清理过期临时文件: {f.name}")
+            except Exception as e:
+                logger.warning(f"清理临时文件失败 {f.name}: {e}")
+
 manager = ModelManager()
 downloader = BilibiliDownloader()
 transcription_service = TranscriptionService(manager)
@@ -164,7 +131,7 @@ class WebdavTranscribeRequest(BaseModel):
 def monitor_loop():
     while True:
         time.sleep(config.check_interval)
-        if manager.model is not None:
+        if manager._backend is not None:
             if time.time() - manager.last_active_time > config.idle_timeout:
                 manager.unload_model()
 
@@ -174,13 +141,19 @@ bg_thread.start()
 # ================= API 接口 =================
 app = FastAPI()
 
-# 启动时清理过期缓存
+# 启动时清理过期缓存 + 预加载模型
 @app.on_event("startup")
 async def startup_event():
     """应用启动时的事件处理"""
     logger.info("服务启动中...")
     cache_manager.cleanup_expired_cache()
-    logger.info("服务启动完成")
+    logger.info("预加载模型...")
+    try:
+        manager.load_model_if_needed()
+        logger.info("预加载完成，服务器已就绪！")
+    except Exception as e:
+        logger.warning(f"预加载失败 - {e}")
+        logger.info("服务器将继续启动，将在首次请求时重试加载模型")
 
 # Token验证中间件
 @app.middleware("http")
@@ -242,6 +215,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
                 os.remove(temp_filename)
         except Exception as e:
             logger.warning(f"警告：临时文件删除失败 {temp_filename}: {e}")
+        cleanup_stale_tmp_files()
 
 @app.post("/transcribe_url")
 async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
@@ -251,11 +225,13 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
         # 1. 下载音频文件到tmp目录
         logger.info(f"开始下载B站音频: bvid={request.bvid}")
 
+        download_start = time.time()
         success, result = downloader.download_bilibili_audio(
             request.bvid,
             request.cookie,
             save_dir=str(get_temp_dir())
         )
+        download_time = time.time() - download_start
 
         if not success:
             return {
@@ -264,7 +240,8 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
                 "type": config.subtitle_config["type"],
                 "version": config.subtitle_config["version"],
                 "body": [],
-                "rtf": 0.0
+                "rtf": 0.0,
+                "timing": {"download": round(download_time, 3)}
             }
 
         temp_filename = result["file_path"]  # 从字典中获取文件路径
@@ -276,6 +253,10 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
         # 使用更友好的文件名用于日志显示
         display_name = f"Bilibili_{request.bvid}"
         result = await transcription_service.process_transcription(temp_filename, display_name, audio_url, request.bvid, audio_id, request.no_cache)
+
+        # 注入下载耗时到 timing
+        if "timing" in result:
+            result["timing"]["download"] = round(download_time, 3)
 
         return result
 
@@ -291,6 +272,7 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
                     logger.warning(f"警告：临时文件删除失败 {temp_filename}: {e}")
             else:
                 logger.info(f"缓存文件保留: {temp_filename}")
+        cleanup_stale_tmp_files()
 
 
 @app.post("/transcribe_file")

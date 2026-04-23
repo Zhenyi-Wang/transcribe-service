@@ -26,10 +26,13 @@ class CacheManager:
         else:
             logger.info("缓存已禁用")
 
-    def _get_cache_key(self, url: str = None, bvid: str = None, audio_id: str = None) -> str:
+    def _get_cache_key(self, url: str = None, bvid: str = None, audio_id: str = None, file_path: str = None) -> str:
         """生成缓存键"""
+        # 优先使用文件路径作为缓存键
+        if file_path:
+            content = file_path
         # 优先使用BVID+音频ID作为缓存键，更稳定
-        if bvid and audio_id:
+        elif bvid and audio_id:
             content = f"{bvid}_{audio_id}"
         elif url and bvid:
             # 兼容旧版本，使用URL+BVID
@@ -98,13 +101,16 @@ class CacheManager:
             logger.error(f"缓存文件失败: {e}")
             return file_path
 
-    def get_cached_transcript(self, url: str = None, bvid: str = None, audio_id: str = None) -> Optional[Dict[str, Any]]:
+    def get_cached_transcript(self, url: str = None, bvid: str = None, audio_id: str = None, file_path: str = None) -> Optional[Dict[str, Any]]:
         """获取缓存的转录结果"""
         if not self.cache_enabled:
             return None
 
+        # 优先使用文件路径作为缓存键
+        if file_path:
+            cache_key = self._get_cache_key(file_path=file_path)
         # 优先使用BVID+音频ID作为缓存键
-        if bvid and audio_id:
+        elif bvid and audio_id:
             cache_key = self._get_cache_key(bvid=bvid, audio_id=audio_id)
         else:
             cache_key = self._get_cache_key(url=url, bvid=bvid)
@@ -129,13 +135,16 @@ class CacheManager:
 
         return None
 
-    def save_transcript_to_cache(self, url: str = None, transcript_data: Dict[str, Any] = None, bvid: str = None, audio_id: str = None) -> None:
+    def save_transcript_to_cache(self, url: str = None, transcript_data: Dict[str, Any] = None, bvid: str = None, audio_id: str = None, file_path: str = None) -> None:
         """保存转录结果到缓存"""
         if not self.cache_enabled or not transcript_data:
             return
 
+        # 优先使用文件路径作为缓存键
+        if file_path:
+            cache_key = self._get_cache_key(file_path=file_path)
         # 优先使用BVID+音频ID作为缓存键
-        if bvid and audio_id:
+        elif bvid and audio_id:
             cache_key = self._get_cache_key(bvid=bvid, audio_id=audio_id)
         else:
             cache_key = self._get_cache_key(url=url, bvid=bvid)

@@ -1,22 +1,38 @@
 # 音频转录服务配置文件
 # 复制此文件为 config.yaml 并根据需要修改配置
 
+# 后端配置（funasr / qwen3-asr / gguf）
+backend:
+  name: "qwen3-asr"  # 后端类型
+  # GGUF 后端配置
+  gguf:
+    asr_precision: "q4_k"               # ASR 量化精度: f16 / q8_0 / q4_k / q4_k_m
+    model_dir: "~/models/qwen3-asr-gguf"  # GGUF 模型目录
+    use_cuda: true                     # 是否使用 CUDA 加速
+  # Qwen3-ASR Transformers 后端配置
+  qwen3-asr:
+    asr_model: "Qwen/Qwen3-ASR-1.7B"
+    forced_aligner: "Qwen/Qwen3-ForcedAligner-0.6B"
+    dtype: "float16"
+    max_new_tokens: 4096
+  # FunASR 后端配置
+  funasr:
+    model: "paraformer-zh"
+    vad_model: "fsmn-vad"
+    punc_model: "ct-punc"
+
 # 服务器配置
 server:
   idle_timeout: 300      # 5分钟无请求自动释放模型（秒）
   check_interval: 10     # 模型状态检查间隔（秒）
 
-# 模型配置
-model:
-  asr_model: "Qwen/Qwen3-ASR-1.7B"           # ASR 模型
-  forced_aligner: "Qwen/Qwen3-ForcedAligner-0.6B"  # 时间戳对齐模型（可选，留空则无时间戳）
-  dtype: "bfloat16"                          # 模型精度
-  max_new_tokens: 4096                       # 最大生成长度
-
 # 处理配置
 processing:
-  max_segment_length: 20                    # 字幕最大长度（字符数）
-  duration_per_segment: 3.0                 # 每段字幕持续时间（秒，仅无时间戳回退时使用）
+  batch_size_s: 300                     # 批处理大小（秒）
+  max_segment_length: 20                # 字幕最大长度（字符数）
+  duration_per_segment: 3.0             # 每段字幕持续时间（秒）- 仅在禁用时间戳时使用
+  enable_timestamp: true                # 是否启用模型时间戳
+  chinese_ratio_threshold: 0.3          # 中文比例阈值
 
 # 缓存配置
 cache:
@@ -39,3 +55,7 @@ api:
   host: "0.0.0.0"  # 监听地址
   port: 8000       # 监听端口
   token: ""         # API访问令牌，空表示不需要验证
+
+# 网盘配置
+webdav:
+  base_path: "/mnt/webdav"  # webdav挂载路径
