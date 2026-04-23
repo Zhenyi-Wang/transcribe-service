@@ -67,7 +67,7 @@ class GGUFBackend(ASRBackend):
             raise RuntimeError("模型未加载，请先调用 load()")
 
         t_start = time.time()
-        result = self._engine.transcribe(audio_file, language=language)
+        result = self._engine.transcribe(audio_file, language=language, streaming=False)
         t_total = time.time() - t_start
 
         # 转换时间戳格式
