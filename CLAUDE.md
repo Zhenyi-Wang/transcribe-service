@@ -50,9 +50,29 @@ GGUF 后端在 `backends/gguf_backend.py` 之上还有 `qwen_asr_gguf/` 包（ON
 
 ### 配置
 
-`config.py` 的 `Config` 类加载 `config.yaml`，支持点号访问 `config.get('backend.gguf.asr_precision')`。`config.yaml.example` 是模板（注意：它的结构可能落后于 `config.yaml`，新增字段以实际运行配置为准）。
+`config.py` 的 `Config` 类加载 `config.yaml`，支持点号访问 `config.get('backend.gguf.asr_precision')`。
 
 GGUF 量化版本通过 `backend.gguf.asr_precision` 控制：`f16` / `q8_0` / `q4_k` / `q4_k_m`。模型文件位于 `~/models/qwen3-asr-gguf/`。
+
+**配置迁移（v1 → v2）**：旧版 `model.*` 顶层字段已移除，需改为 `backend` 分组结构：
+```yaml
+# 旧（已不支持）
+model:
+  asr_model: "Qwen/Qwen3-ASR-1.7B"
+  forced_aligner: "Qwen/Qwen3-ForcedAligner-0.6B"
+  dtype: "bfloat16"
+  max_new_tokens: 4096
+
+# 新
+backend:
+  name: "qwen3-asr"      # 后端选择：gguf / qwen3-asr / funasr
+  qwen3-asr:
+    asr_model: "Qwen/Qwen3-ASR-1.7B"
+    forced_aligner: "Qwen/Qwen3-ForcedAligner-0.6B"
+    dtype: "float16"
+    max_new_tokens: 4096
+```
+最简迁移：将旧 `model` 下的字段移入 `backend.qwen3-asr`，加上 `backend.name: "qwen3-asr"`。参考 `config.yaml.example`。
 
 ### API Endpoints
 
