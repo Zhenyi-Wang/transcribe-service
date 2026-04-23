@@ -264,20 +264,29 @@ def generate_subtitle_segments_from_timestamps(text: str, timestamps: list) -> l
     if avg_len <= 2:
         return _merge_char_timestamps(text, timestamps)
 
-    # 句级时间戳直接使用，但过滤过长段落
+    # 句级时间戳直接使用，但合并过短段落
+    min_len = 5
     body = []
-    for i, ts in enumerate(timestamps):
+    for ts in timestamps:
         seg_text = ts.get("text", "").strip()
         if not seg_text:
             continue
-        body.append({
-            "from": round(ts.get("start", 0), 2),
-            "to": round(ts.get("end", 0), 2),
-            "sid": i + 1,
-            "location": 2,
-            "content": seg_text,
-            "music": 0
-        })
+        if body and len(seg_text) < min_len:
+            body[-1]["content"] += seg_text
+            body[-1]["to"] = round(ts.get("end", 0), 2)
+        else:
+            body.append({
+                "from": round(ts.get("start", 0), 2),
+                "to": round(ts.get("end", 0), 2),
+                "sid": 0,
+                "location": 2,
+                "content": seg_text,
+                "music": 0
+            })
+
+    # 重新编号
+    for i, seg in enumerate(body):
+        seg["sid"] = i + 1
 
     return body if body else generate_subtitle_segments(text)
 
@@ -291,6 +300,7 @@ def _merge_char_timestamps(text: str, timestamps: list) -> list:
     import re
 
     max_len = config.max_segment_length
+    min_len = 5
 
     # 拼出时间戳的纯文本（不含标点），用于和 text 对齐
     ts_chars = "".join(ts.get("text", "") for ts in timestamps)
@@ -309,6 +319,15 @@ def _merge_char_timestamps(text: str, timestamps: list) -> list:
                 part = part.strip()
                 if part:
                     segments.append(part)
+
+    # 合并过短的段落（少于 min_len 字）到前一段
+    merged = []
+    for seg in segments:
+        if merged and len(re.sub(r'[^\w]', '', seg, flags=re.UNICODE)) < min_len:
+            merged[-1] += seg
+        else:
+            merged.append(seg)
+    segments = merged
 
     # 将每个文本段映射到时间戳范围
     # 从 text 中去掉标点，逐段推进 ts_chars 的偏移

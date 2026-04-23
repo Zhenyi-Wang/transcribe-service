@@ -67,7 +67,7 @@ class GGUFBackend(ASRBackend):
             raise RuntimeError("模型未加载，请先调用 load()")
 
         t_start = time.time()
-        result = self._engine.transcribe(audio_file, language=language or "Chinese")
+        result = self._engine.transcribe(audio_file, language=language)
         t_total = time.time() - t_start
 
         # 转换时间戳格式
@@ -82,9 +82,15 @@ class GGUFBackend(ASRBackend):
         audio_duration = result.performance.get("audio_duration", 0) if result.performance else 0
         rtf = t_total / audio_duration if audio_duration > 0 else 0
 
+        # 检测语言
+        detected_lang = "zh"
+        if hasattr(result, "language") and result.language:
+            from transcribe import LANG_MAP
+            detected_lang = LANG_MAP.get(result.language, "zh")
+
         return TranscribeResult(
             text=result.text,
-            language=language or "zh",
+            language=detected_lang,
             timestamps=timestamps,
             performance={
                 "rtf": rtf,
