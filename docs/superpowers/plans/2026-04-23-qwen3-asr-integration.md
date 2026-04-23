@@ -514,10 +514,27 @@ Expected: 成功安装
 Run: `bash run.sh`
 Expected: 服务启动，模型下载并加载成功
 
-- [ ] **Step 3: 测试 API**
+- [ ] **Step 3: 用测试音频验证转录功能**
 
-Run: `curl -X POST "http://localhost:31080/transcribe" -F "file=@test/test.mp3"`
-Expected: 返回正确的转录结果 JSON
+在一个终端启动服务：
+
+```bash
+bash run.sh
+```
+
+等待模型加载完成后，在另一个终端发送测试请求：
+
+```bash
+curl -s -X POST "http://localhost:31080/transcribe" -F "file=@test/test.mp3" | python -m json.tool
+```
+
+Expected: 返回 JSON 包含 `"status": "success"`、`"body"` 数组（带 `from`/`to` 时间戳和 `content` 字段）、`"lang"` 字段
+
+验证要点：
+- `status` 为 `"success"`
+- `body` 不为空数组
+- 每个字幕段都有 `from`、`to`、`content` 字段
+- `from` < `to`（时间戳递增）
 
 - [ ] **Step 4: 最终 Commit**
 
