@@ -1,6 +1,9 @@
 """GGUF 后端实现"""
 import os
+import sys
 import time
+import io
+import contextlib
 from typing import Optional, List, Dict, Any
 
 from .base import ASRBackend, TranscribeResult
@@ -67,7 +70,8 @@ class GGUFBackend(ASRBackend):
             raise RuntimeError("模型未加载，请先调用 load()")
 
         t_start = time.time()
-        result = self._engine.transcribe(audio_file, language=language, streaming=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = self._engine.transcribe(audio_file, language=language)
         t_total = time.time() - t_start
 
         # 转换时间戳格式
