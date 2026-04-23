@@ -251,21 +251,25 @@ def generate_subtitle_segments_from_timestamps(text: str, timestamps: list) -> l
         text: 转录文本（含标点）
         timestamps: 时间戳列表，格式为 [{"text": str, "start": float, "end": float}, ...]
 
-    Returns:
-        list: 字幕段落列表
+    字级时间戳（GGUF/Qwen3-ASR，每段1字）需要按标点合并为短语；
+    句级时间戳（FunASR，每段已是短语）直接使用。
     """
     import re
 
     if not timestamps:
-        # 回退到均匀分配
         return generate_subtitle_segments(text)
 
+    # 判断是否为字级时间戳：前 10 段平均文本长度 <= 2 视为字级
+    avg_len = sum(len(ts.get("text", "")) for ts in timestamps[:10]) / min(len(timestamps), 10)
+    if avg_len <= 2:
+        return _merge_char_timestamps(text, timestamps)
+
+    # 句级时间戳直接使用，但过滤过长段落
     body = []
     for i, ts in enumerate(timestamps):
         seg_text = ts.get("text", "").strip()
         if not seg_text:
             continue
-
         body.append({
             "from": round(ts.get("start", 0), 2),
             "to": round(ts.get("end", 0), 2),
@@ -274,6 +278,71 @@ def generate_subtitle_segments_from_timestamps(text: str, timestamps: list) -> l
             "content": seg_text,
             "music": 0
         })
+
+    return body if body else generate_subtitle_segments(text)
+
+
+def _merge_char_timestamps(text: str, timestamps: list) -> list:
+    """将字级时间戳按标点合并为字幕段落
+
+    策略：先按句末标点分句，再对过长句子按逗号拆分。
+    每段字幕取对应范围内首字的 start 和末字的 end。
+    """
+    import re
+
+    max_len = config.max_segment_length
+
+    # 拼出时间戳的纯文本（不含标点），用于和 text 对齐
+    ts_chars = "".join(ts.get("text", "") for ts in timestamps)
+
+    # 按标点分句
+    raw_sentences = re.split(r'(?<=[。！？])', text)
+    segments = []
+    for sent in raw_sentences:
+        sent = sent.strip()
+        if not sent:
+            continue
+        if len(sent) <= max_len:
+            segments.append(sent)
+        else:
+            for part in re.split(r'(?<=[，、；：])', sent):
+                part = part.strip()
+                if part:
+                    segments.append(part)
+
+    # 将每个文本段映射到时间戳范围
+    # 从 text 中去掉标点，逐段推进 ts_chars 的偏移
+    body = []
+    ts_offset = 0
+
+    for seg_text in segments:
+        # 去掉标点后的纯文本长度，用于在 ts_chars 中定位
+        clean_seg = re.sub(r'[^\w]', '', seg_text, flags=re.UNICODE)
+        seg_len = len(clean_seg)
+
+        if seg_len == 0 or ts_offset >= len(ts_chars):
+            continue
+
+        # 在 ts_chars 中找到匹配位置
+        match_pos = ts_chars.find(clean_seg, ts_offset)
+        if match_pos < 0:
+            # 逐字推进兜底
+            match_pos = ts_offset
+
+        start_idx = match_pos
+        end_idx = min(match_pos + seg_len - 1, len(timestamps) - 1)
+
+        if start_idx < len(timestamps) and end_idx < len(timestamps):
+            body.append({
+                "from": round(timestamps[start_idx].get("start", 0), 2),
+                "to": round(timestamps[end_idx].get("end", 0), 2),
+                "sid": len(body) + 1,
+                "location": 2,
+                "content": seg_text,
+                "music": 0
+            })
+
+        ts_offset = end_idx + 1
 
     return body if body else generate_subtitle_segments(text)
 
