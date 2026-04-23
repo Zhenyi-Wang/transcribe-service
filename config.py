@@ -47,29 +47,24 @@ class Config:
         return self.get('server.check_interval', 10)
 
     @property
-    def model_name(self) -> str:
-        """模型名称"""
-        return self.get('model.name', 'paraformer-zh')
+    def asr_model(self) -> str:
+        """ASR 模型名称"""
+        return self.get('model.asr_model', 'Qwen/Qwen3-ASR-1.7B')
 
     @property
-    def vad_model(self) -> str:
-        """VAD模型名称"""
-        return self.get('model.vad_model', 'fsmn-vad')
+    def forced_aligner(self) -> str:
+        """时间戳对齐模型"""
+        return self.get('model.forced_aligner', 'Qwen/Qwen3-ForcedAligner-0.6B')
 
     @property
-    def punc_model(self) -> str:
-        """标点模型名称"""
-        return self.get('model.punc_model', 'ct-punc')
+    def dtype(self) -> str:
+        """模型精度"""
+        return self.get('model.dtype', 'bfloat16')
 
     @property
-    def disable_update(self) -> bool:
-        """禁用模型更新检查"""
-        return self.get('model.disable_update', True)
-
-    @property
-    def batch_size_s(self) -> int:
-        """批处理大小（秒）"""
-        return self.get('processing.batch_size_s', 300)
+    def max_new_tokens(self) -> int:
+        """最大生成 token 数"""
+        return self.get('model.max_new_tokens', 4096)
 
     @property
     def max_segment_length(self) -> int:
@@ -81,15 +76,6 @@ class Config:
         """每段字幕持续时间（秒）"""
         return self.get('processing.duration_per_segment', 3.0)
 
-    @property
-    def enable_timestamp(self) -> bool:
-        """是否启用时间戳"""
-        return self.get('processing.enable_timestamp', True)
-
-    @property
-    def chinese_ratio_threshold(self) -> float:
-        """中文比例阈值"""
-        return self.get('processing.chinese_ratio_threshold', 0.3)
 
     # 字幕样式配置
     @property
