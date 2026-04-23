@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a **FunASR-based audio transcription service** that provides REST APIs for transcribing audio files and Bilibili videos. It returns subtitle data in Bilibili-compatible JSON format.
+This is a **Qwen3-ASR-based audio transcription service** that provides REST APIs for transcribing audio files and Bilibili videos. It returns subtitle data in Bilibili-compatible JSON format.
 
 ## Commands
 
@@ -52,7 +52,8 @@ transcribe-service/
 
 - `server.idle_timeout`: Model unload timeout (seconds)
 - `server.check_interval`: Model health check interval
-- `model.name`: FunASR model (default: paraformer-zh)
+- `model.asr_model`: Qwen3-ASR model (default: Qwen/Qwen3-ASR-1.7B)
+- `model.forced_aligner`: Timestamp aligner (default: Qwen/Qwen3-ForcedAligner-0.6B)
 - `api.host`, `api.port`: Server listen address
 - `api.token`: Bearer token for authentication (empty = no auth)
 - `webdav.base_path`: Base path for /transcribe_file endpoint (default: /mnt/webdav)
@@ -60,11 +61,11 @@ transcribe-service/
 ### Key Classes
 
 - `TranscriptionService` (transcribe.py): Core transcription orchestration
-- `ModelManager` (transcribe.py): FunASR model loading/unloading
+- `ModelManager` (server.py): Qwen3-ASR model loading/unloading
 - `BilibiliDownloader`, `BilibiliVideoDownloader`, `BilibiliEpisodeDownloader` (downloaders/): Audio download from Bilibili
 
 ## Environment
 
-- Python 3.11+ with conda environment named `funasr`
+- Python 3.12+ with conda environment named `funasr`
 - PyTorch with CUDA support (or CPU version)
-- FunASR models downloaded from ModelScope on first run
+- Qwen3-ASR models downloaded from HuggingFace on first run
