@@ -8,6 +8,16 @@ from cache_manager import cache_manager
 
 logger = setup_logger(__name__)
 
+# 语言映射：Qwen3-ASR 返回全名 → 项目使用的短代码
+LANG_MAP = {
+    "Chinese": "zh", "English": "en", "Japanese": "ja",
+    "Korean": "ko", "French": "fr", "German": "de",
+    "Spanish": "es", "Portuguese": "pt", "Russian": "ru",
+    "Arabic": "ar", "Thai": "th", "Vietnamese": "vi",
+    "Indonesian": "id", "Italian": "it", "Cantonese": "yue",
+    "Turkish": "tr", "Hindi": "hi", "Malay": "ms",
+}
+
 def get_audio_duration(file_path: str) -> float:
     """获取音频文件的时长（秒）
 
@@ -68,49 +78,6 @@ def get_audio_duration(file_path: str) -> float:
     except Exception as e:
         logger.error(f"获取音频时长失败: {e}")
         return 0.0
-
-def detect_language_from_result(result):
-    """从FunASR结果中提取语言信息"""
-    try:
-        if not result or len(result) == 0:
-            return "zh"  # 默认中文
-
-        # FunASR会在结果中包含语言信息
-        # 通常在result[0]中可能包含language字段或通过文本内容判断
-        text = result[0].get("text", "")
-
-        # 简单的基于字符的语言检测
-        if not text:
-            return "zh"
-
-        # 统计中文字符比例
-        import re
-        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
-        total_chars = len(re.sub(r'\s', '', text))
-
-        if total_chars == 0:
-            return "zh"
-
-        chinese_ratio = chinese_chars / total_chars
-
-        # 如果中文字符超过阈值，认为是中文
-        if chinese_ratio > config.chinese_ratio_threshold:
-            return "zh"
-        # 检测英文
-        elif re.match(r'^[a-zA-Z\s\d\W]+$', text):
-            return "en"
-        # 检测日文（包含平假名和片假名）
-        elif re.search(r'[\u3040-\u309f\u30a0-\u30ff]', text):
-            return "ja"
-        # 检测韩文
-        elif re.search(r'[\uac00-\ud7af]', text):
-            return "ko"
-        else:
-            return "zh"  # 默认中文
-
-    except Exception as e:
-        logger.error(f"语言检测失败: {e}")
-        return "zh"
 
 def split_text_into_segments(text, max_length=None):
     """将长文本分割成适合字幕显示的短句段落"""
@@ -173,73 +140,68 @@ def generate_subtitle_segments(text, asr_result=None):
 
     Args:
         text: 转录文本
-        asr_result: ASR原始结果（包含时间戳信息）
+        asr_result: Qwen3-ASR 结果对象（包含 time_stamps 属性）
     """
     import re
 
-    # 如果启用时间戳且ASR结果包含时间戳信息
-    if config.enable_timestamp and asr_result and len(asr_result) > 0:
-        # 尝试从ASR结果中提取时间戳
-        result = asr_result[0]
-        body = []
-
-        # FunASR sentence_timestamp=True 时返回 sentence_info
-        if "sentence_info" in result:
-            sentence_info = result["sentence_info"]
-            if isinstance(sentence_info, list):
-                for i, seg in enumerate(sentence_info):
-                    if isinstance(seg, dict) and "text" in seg:
-                        # 获取句子文本和时间戳
-                        sentence_text = seg["text"]
-                        start_ms = seg.get("start", 0)
-                        end_ms = seg.get("end", start_ms)
-
-                        # 转换毫秒为秒
-                        start_time = float(start_ms) / 1000
-                        end_time = float(end_ms) / 1000
-
-                        if sentence_text.strip():
-                            body.append({
-                                "from": round(start_time, 2),
-                                "to": round(end_time, 2),
-                                "sid": i + 1,
-                                "location": 2,
-                                "content": sentence_text.strip(),
-                                "music": 0
-                            })
-
-                if body:  # 如果成功提取了时间戳
-                    return body
-
-        # 2. 尝试其他可能的时间戳字段
-        timestamp_fields = ["segments", "sentences", "words", "timestamp_detail", "time_stamps"]
-        for field in timestamp_fields:
-            if field in result:
-                segments = result[field]
-                if isinstance(segments, list):
-                    for i, seg in enumerate(segments):
-                        if isinstance(seg, dict):
-                            start_time = seg.get("start", seg.get("begin", 0))
-                            end_time = seg.get("end", seg.get("finish", start_time + config.duration_per_segment))
-                            text_seg = seg.get("text", seg.get("word", seg.get("txt", "")))
-
-                            if text_seg.strip():
-                                body.append({
-                                    "from": round(start_time, 2),
-                                    "to": round(end_time, 2),
-                                    "sid": i + 1,
-                                    "location": 2,
-                                    "content": text_seg.strip(),
-                                    "music": 0
-                                })
-
-                    if body:
-                        return body
-
-    # 如果没有时间戳信息或禁用了时间戳，使用原始逻辑
-    segments = split_text_into_segments(text)
     body = []
 
+    # 如果有 ASR 结果且包含时间戳
+    if asr_result is not None:
+        time_stamps = getattr(asr_result, 'time_stamps', None)
+
+        if time_stamps and len(time_stamps) > 0:
+            # time_stamps 是字/词级别列表，每个元素有 .text, .start_time, .end_time
+            # 按标点符号分组为句子级时间戳
+
+            current_sentence = []
+            sentence_start = None
+
+            for ts in time_stamps:
+                word_text = ts.text if hasattr(ts, 'text') else str(ts[0])
+                word_start = ts.start_time if hasattr(ts, 'start_time') else ts[1]
+                word_end = ts.end_time if hasattr(ts, 'end_time') else ts[2]
+
+                if sentence_start is None:
+                    sentence_start = word_start
+
+                current_sentence.append(word_text)
+
+                # 检查是否是句子结束标点
+                if word_text in ['，', '。', '！', '？', '；', '、'] or word_text.strip() == '':
+                    if current_sentence:
+                        sentence_text = ''.join(current_sentence).strip()
+                        if sentence_text:
+                            body.append({
+                                "from": round(sentence_start, 2),
+                                "to": round(word_end, 2),
+                                "sid": len(body) + 1,
+                                "location": 2,
+                                "content": sentence_text,
+                                "music": 0
+                            })
+                        current_sentence = []
+                        sentence_start = None
+
+            # 处理最后一个未结束的句子
+            if current_sentence:
+                sentence_text = ''.join(current_sentence).strip()
+                if sentence_text and sentence_start is not None:
+                    last_end = time_stamps[-1].end_time if hasattr(time_stamps[-1], 'end_time') else time_stamps[-1][2]
+                    body.append({
+                        "from": round(sentence_start, 2),
+                        "to": round(last_end, 2),
+                        "sid": len(body) + 1,
+                        "location": 2,
+                        "content": sentence_text,
+                        "music": 0
+                    })
+
+            if body:
+                return body
+
+    # 回退路径：无时间戳时使用均匀分配
+    segments = split_text_into_segments(text)
     for i, segment in enumerate(segments):
         start_time = i * config.duration_per_segment
         end_time = (i + 1) * config.duration_per_segment
@@ -261,7 +223,7 @@ class TranscriptionService:
     def __init__(self, model_manager):
         self.model_manager = model_manager
 
-    async def process_transcription(self, audio_file_path: str, original_filename: str = None, audio_url: str = None, bvid: str = None, audio_id: str = None, no_cache: bool = False):
+    async def process_transcription(self, audio_file_path: str, original_filename: str = None, audio_url: str = None, bvid: str = None, audio_id: str = None, no_cache: bool = False, file_path_for_cache: str = None):
         """
         处理音频转录的主函数
 
@@ -272,13 +234,21 @@ class TranscriptionService:
             bvid: B站视频ID（用于缓存，可选）
             audio_id: 音频ID（用于缓存，可选）
             no_cache: 是否禁用缓存（默认False）
+            file_path_for_cache: 文件路径（用于网盘文件缓存，可选）
 
         Returns:
             dict: 转录结果
         """
         # 检查转录缓存（除非禁用缓存）
         if not no_cache:
-            if audio_id and bvid:
+            # 优先使用文件路径作为缓存键（网盘文件）
+            if file_path_for_cache:
+                cached_result = cache_manager.get_cached_transcript(file_path=file_path_for_cache)
+                if cached_result:
+                    cached_result.pop('cached_at', None)
+                    logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
+                    return cached_result
+            elif audio_id and bvid:
                 # 优先使用BVID+音频ID检查转录缓存
                 cached_result = cache_manager.get_cached_transcript(None, bvid, audio_id)
                 if cached_result:
@@ -323,11 +293,20 @@ class TranscriptionService:
             # 记录转录开始时间，计算纯粹的转换时间（处理时长）
             transcription_start_time = time.time()
 
-            res = asr_model.generate(
-                input=audio_file_path,
-                batch_size_s=config.batch_size_s,
-                disable_pbar=True
+            # 根据配置决定是否启用时间戳
+            return_time_stamps = bool(config.forced_aligner)
+
+            res = asr_model.transcribe(
+                audio=audio_file_path,
+                language=None,  # 自动检测
+                return_time_stamps=return_time_stamps,
             )
+
+            # 调试：打印返回结果结构
+            if res:
+                logger.info(f"Qwen3-ASR 返回: language={res[0].language}, text 长度={len(res[0].text)}")
+                if return_time_stamps and hasattr(res[0], 'time_stamps'):
+                    logger.info(f"时间戳数量: {len(res[0].time_stamps) if res[0].time_stamps else 0}")
 
             # 计算处理时长（纯粹的转换时间）
             processing_time = time.time() - transcription_start_time
@@ -336,9 +315,9 @@ class TranscriptionService:
             self.model_manager.last_active_time = time.time()
 
             # 获取转录文本
-            transcript_text = res[0]["text"] if res else ""
+            transcript_text = res[0].text if res else ""
 
-            # 计算RTF比值（处理时长/音频时长）
+            # 计算RTF比值
             rtf_ratio = 0.0
             if audio_duration > 0:
                 rtf_ratio = processing_time / audio_duration
@@ -356,19 +335,12 @@ class TranscriptionService:
                 logger.info(f"状态:         非实时处理 ⏱️ (RTF ≥ 1)")
             logger.info(f"{'='*50}\n")
 
-            # 记录所有指标到日志
-            logger.info(f"转录完成 - 处理时长: {processing_time:.2f}秒, RTF比值: {rtf_ratio:.3f}")
-
-            # 如果启用了时间戳，打印关键信息
-            if config.enable_timestamp and res and "sentence_info" in res[0]:
-                logger.info(f"检测到 {len(res[0]['sentence_info'])} 个句子")
-
-            # 检测语言
-            detected_lang = detect_language_from_result(res)
+            # 检测语言（从 Qwen3-ASR 结果直接获取）
+            detected_lang = LANG_MAP.get(res[0].language, "zh") if res else "zh"
             logger.info(f"检测到语言: {detected_lang}")
 
-            # 生成字幕格式（传递ASR结果以获取真实时间戳）
-            subtitle_body = generate_subtitle_segments(transcript_text, res)
+            # 生成字幕格式（传递 ASR 结果对象以获取时间戳）
+            subtitle_body = generate_subtitle_segments(transcript_text, res[0] if res else None)
 
             # 从配置获取字幕样式
             subtitle_config = config.subtitle_config
@@ -391,7 +363,10 @@ class TranscriptionService:
             }
 
             # 保存到缓存
-            if audio_id and bvid:
+            if file_path_for_cache:
+                # 使用文件路径保存缓存
+                cache_manager.save_transcript_to_cache(file_path=file_path_for_cache, transcript_data=result)
+            elif audio_id and bvid:
                 # 优先使用BVID+音频ID保存
                 cache_manager.save_transcript_to_cache(None, result, bvid, audio_id)
             elif audio_url or bvid:
