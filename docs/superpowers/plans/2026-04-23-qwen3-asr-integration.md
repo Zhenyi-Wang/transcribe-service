@@ -26,7 +26,7 @@
 ### Task 1: 更新 config.py 配置属性
 
 **Files:**
-- Modify: `config.py:50-67`
+- Modify: `config.py:49-92`（非连续，需逐个删除指定属性）
 
 - [ ] **Step 1: 删除旧模型属性，添加新属性**
 
@@ -108,7 +108,7 @@ git commit -m "docs: 更新配置示例，适配 Qwen3-ASR"
 ### Task 3: 重写 server.py 的 ModelManager
 
 **Files:**
-- Modify: `server.py:23-101`
+- Modify: `server.py:23-101, 368`
 
 - [ ] **Step 1: 替换环境变量**
 
@@ -143,29 +143,27 @@ def load_model_if_needed(self):
                 logger.info("如果是第一次运行，正在自动从 HuggingFace 下载模型，请耐心等待...")
 
                 try:
-                    import torch
                     from qwen_asr import Qwen3ASRModel
 
                     dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float16
                     
                     # 构建模型参数
-                    model_kwargs = {
-                        config.asr_model,  # 第一个参数是模型路径
-                        dtype=dtype,
-                        device_map=target_device,
-                        max_new_tokens=config.max_new_tokens,
-                    }
-
-                    # 如果配置了 forced_aligner，加载时间戳对齐模型
+                    forced_aligner_kwargs = None
                     if config.forced_aligner:
-                        model_kwargs["forced_aligner"] = config.forced_aligner
-                        model_kwargs["forced_aligner_kwargs"] = dict(
+                        forced_aligner_kwargs = dict(
                             dtype=dtype,
                             device_map=target_device,
                         )
                         logger.info("已启用时间戳对齐模型")
 
-                    self.model = Qwen3ASRModel.from_pretrained(**model_kwargs)
+                    self.model = Qwen3ASRModel.from_pretrained(
+                        config.asr_model,  # 第一个参数是模型路径（位置参数）
+                        dtype=dtype,
+                        device_map=target_device,
+                        max_new_tokens=config.max_new_tokens,
+                        forced_aligner=config.forced_aligner if config.forced_aligner else None,
+                        forced_aligner_kwargs=forced_aligner_kwargs,
+                    )
                     self.device = target_device
                     logger.info(f"模型加载成功！运行在: {self.device}")
                     
@@ -175,26 +173,25 @@ def load_model_if_needed(self):
                         logger.warning("显存不足，正在切换回 CPU 模式...")
                         torch.cuda.empty_cache()
 
-                        import torch
                         from qwen_asr import Qwen3ASRModel
                         
                         dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float16
                         
-                        model_kwargs = {
-                            config.asr_model,
-                            dtype=dtype,
-                            device_map="cpu",
-                            max_new_tokens=config.max_new_tokens,
-                        }
-
+                        forced_aligner_kwargs = None
                         if config.forced_aligner:
-                            model_kwargs["forced_aligner"] = config.forced_aligner
-                            model_kwargs["forced_aligner_kwargs"] = dict(
+                            forced_aligner_kwargs = dict(
                                 dtype=dtype,
                                 device_map="cpu",
                             )
 
-                        self.model = Qwen3ASRModel.from_pretrained(**model_kwargs)
+                        self.model = Qwen3ASRModel.from_pretrained(
+                            config.asr_model,
+                            dtype=dtype,
+                            device_map="cpu",
+                            max_new_tokens=config.max_new_tokens,
+                            forced_aligner=config.forced_aligner if config.forced_aligner else None,
+                            forced_aligner_kwargs=forced_aligner_kwargs,
+                        )
                         self.device = "cpu"
                         logger.info("CPU 模式加载成功。")
                     else:
@@ -203,12 +200,20 @@ def load_model_if_needed(self):
     return self.model
 ```
 
-- [ ] **Step 4: 验证语法正确**
+- [ ] **Step 4: 更新 `__main__` 块中的 ModelScope 引用**
+
+将第 368 行的日志消息从 "ModelScope" 改为 "HuggingFace"：
+
+```python
+logger.info("注意：第一次运行时仍需要从 HuggingFace 下载模型，请耐心等待...")
+```
+
+- [ ] **Step 5: 验证语法正确**
 
 Run: `python -m py_compile server.py`
 Expected: 无报错
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add server.py
@@ -220,7 +225,7 @@ git commit -m "refactor: 重写 ModelManager，使用 qwen_asr 替换 FunASR"
 ### Task 4: 重写 transcribe.py 的转录逻辑
 
 **Files:**
-- Modify: `transcribe.py:72-114, 171-310, 358-476`
+- Modify: `transcribe.py:72-114, 171-310, 389-445`
 
 - [ ] **Step 1: 删除 `detect_language_from_result` 函数**
 
@@ -353,7 +358,7 @@ if res:
 
 - [ ] **Step 5: 更新转录文本和语言提取**
 
-将第 412-442 行替换为：
+将第 412-445 行替换为：
 
 ```python
 # 获取转录文本
