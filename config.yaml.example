@@ -8,17 +8,15 @@ server:
 
 # 模型配置
 model:
-  name: "paraformer-zh"  # 核心识别模型
-  vad_model: "fsmn-vad"  # VAD模型（语音活动检测）
-  punc_model: "ct-punc"  # 标点符号模型
-  disable_update: true   # 禁用每次启动时的模型更新检查
+  asr_model: "Qwen/Qwen3-ASR-1.7B"           # ASR 模型
+  forced_aligner: "Qwen/Qwen3-ForcedAligner-0.6B"  # 时间戳对齐模型（可选，留空则无时间戳）
+  dtype: "bfloat16"                          # 模型精度
+  max_new_tokens: 4096                       # 最大生成长度
 
 # 处理配置
 processing:
-  batch_size_s: 300                     # 批处理大小（秒）
-  max_segment_length: 20                # 字幕最大长度（字符数）
-  duration_per_segment: 3.0             # 每段字幕持续时间（秒）
-  chinese_ratio_threshold: 0.3          # 中文比例阈值
+  max_segment_length: 20                    # 字幕最大长度（字符数）
+  duration_per_segment: 3.0                 # 每段字幕持续时间（秒，仅无时间戳回退时使用）
 
 # 缓存配置
 cache:
