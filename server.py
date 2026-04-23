@@ -20,9 +20,9 @@ from logger_config import setup_logger
 from cache_manager import cache_manager
 from pydantic import BaseModel
 
-# 减少FunASR的冗余日志输出
-os.environ['MODELSCOPE_CACHE'] = str(Path.home() / ".cache/modelscope")
-os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'  # 禁用进度条
+# 设置 HuggingFace 缓存目录和日志
+os.environ['HF_HOME'] = str(Path.home() / ".cache/huggingface")
+os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
 
 # 使用统一的logger配置
 logger = setup_logger('server')
@@ -34,69 +34,71 @@ class ModelManager:
         self.last_active_time = 0
         self.device = "cpu"
 
-    def _build_model_kwargs(self, device: str) -> dict:
-        """构建模型参数，GPU和CPU共享
-
-        Args:
-            device: 设备类型 ('cuda' 或 'cpu')
-
-        Returns:
-            dict: 模型参数字典
-        """
-        model_kwargs = {
-            "model": config.model_name,
-            "vad_model": config.vad_model,
-            "punc_model": config.punc_model,
-            "device": device,
-            "disable_update": config.disable_update,  # 禁止每次都去检查更新，加快加载速度
-            "trust_remote_code": True  # 新模型需要信任远程代码
-        }
-
-        # 如果启用时间戳，添加相应参数
-        if config.enable_timestamp:
-            # 使用句子级别时间戳，更适合字幕生成
-            model_kwargs["sentence_timestamp"] = True
-            logger.info("已启用句子级时间戳")
-
-        return model_kwargs
-
     def load_model_if_needed(self):
         self.last_active_time = time.time()
-        
+
         if self.model is None:
             with self.lock:
                 if self.model is None:
                     # 优先尝试 GPU
-                    target_device = "cuda" if torch.cuda.is_available() else "cpu"
+                    target_device = "cuda:0" if torch.cuda.is_available() else "cpu"
                     logger.info(f"正在加载模型 (Target: {target_device})...")
-                    logger.info("如果是第一次运行，正在自动从 ModelScope 下载模型，请耐心等待...")
+                    logger.info("如果是第一次运行，正在自动从 HuggingFace 下载模型，请耐心等待...")
 
                     try:
-                        logger.info("注意：可能显示'Downloading Model'但实际上使用缓存...")
+                        from qwen_asr import Qwen3ASRModel
+
+                        dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float16
 
                         # 构建模型参数
-                        model_kwargs = self._build_model_kwargs(target_device)
+                        forced_aligner_kwargs = None
+                        if config.forced_aligner:
+                            forced_aligner_kwargs = dict(
+                                dtype=dtype,
+                                device_map=target_device,
+                            )
+                            logger.info("已启用时间戳对齐模型")
 
-                        from funasr import AutoModel
-                        self.model = AutoModel(**model_kwargs)
+                        self.model = Qwen3ASRModel.from_pretrained(
+                            config.asr_model,
+                            dtype=dtype,
+                            device_map=target_device,
+                            max_new_tokens=config.max_new_tokens,
+                            forced_aligner=config.forced_aligner if config.forced_aligner else None,
+                            forced_aligner_kwargs=forced_aligner_kwargs,
+                        )
                         self.device = target_device
                         logger.info(f"模型加载成功！运行在: {self.device}")
-                        
+
                     except Exception as e:
                         # 如果是显存炸了(OOM)，切回 CPU 重试
-                        if "out of memory" in str(e).lower() and target_device == "cuda":
+                        if "out of memory" in str(e).lower() and target_device.startswith("cuda"):
                             logger.warning("显存不足，正在切换回 CPU 模式...")
                             torch.cuda.empty_cache()
 
-                            # 构建CPU模式的模型参数
-                            model_kwargs = self._build_model_kwargs("cpu")
+                            from qwen_asr import Qwen3ASRModel
 
-                            from funasr import AutoModel
-                            self.model = AutoModel(**model_kwargs)
+                            dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float16
+
+                            forced_aligner_kwargs = None
+                            if config.forced_aligner:
+                                forced_aligner_kwargs = dict(
+                                    dtype=dtype,
+                                    device_map="cpu",
+                                )
+
+                            self.model = Qwen3ASRModel.from_pretrained(
+                                config.asr_model,
+                                dtype=dtype,
+                                device_map="cpu",
+                                max_new_tokens=config.max_new_tokens,
+                                forced_aligner=config.forced_aligner if config.forced_aligner else None,
+                                forced_aligner_kwargs=forced_aligner_kwargs,
+                            )
                             self.device = "cpu"
                             logger.info("CPU 模式加载成功。")
                         else:
-                            # 其他错误（如下载失败）直接抛出
+                            # 其他错误直接抛出
                             raise e
         return self.model
 
@@ -145,6 +147,14 @@ transcription_service = TranscriptionService(manager)
 class BilibiliTranscribeRequest(BaseModel):
     bvid: str
     cookie: str
+    no_cache: bool = False
+
+    class Config:
+        populate_by_name = True
+
+
+class WebdavTranscribeRequest(BaseModel):
+    path: str
     no_cache: bool = False
 
     class Config:
@@ -282,12 +292,82 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
             else:
                 logger.info(f"缓存文件保留: {temp_filename}")
 
+
+@app.post("/transcribe_file")
+async def transcribe_webdav_file(request: WebdavTranscribeRequest):
+    """转录网盘文件接口"""
+    # 拼接完整文件路径
+    webdav_base = config.get('webdav.base_path', '/mnt/webdav')
+    # 清理路径：移除开头的/，确保拼接正确
+    relative_path = request.path.lstrip('/')
+    full_file_path = os.path.join(webdav_base, relative_path)
+
+    logger.info(f"网盘文件转录: {request.path} -> {full_file_path}")
+
+    # 检查文件是否存在
+    if not os.path.exists(full_file_path):
+        return {
+            "status": "error",
+            "message": f"文件不存在: {request.path}",
+            "type": config.subtitle_config["type"],
+            "version": config.subtitle_config["version"],
+            "body": [],
+            "rtf": 0.0
+        }
+
+    # 检查是否是文件
+    if not os.path.isfile(full_file_path):
+        return {
+            "status": "error",
+            "message": f"路径不是文件: {request.path}",
+            "type": config.subtitle_config["type"],
+            "version": config.subtitle_config["version"],
+            "body": [],
+            "rtf": 0.0
+        }
+
+    # 检查文件是否有读取权限
+    if not os.access(full_file_path, os.R_OK):
+        return {
+            "status": "error",
+            "message": f"文件不可读: {request.path}",
+            "type": config.subtitle_config["type"],
+            "version": config.subtitle_config["version"],
+            "body": [],
+            "rtf": 0.0
+        }
+
+    try:
+        # 使用转录服务处理，传入完整文件路径作为标识用于缓存
+        result = await transcription_service.process_transcription(
+            full_file_path,
+            request.path,  # 使用原始相对路径作为显示名
+            audio_url=None,
+            bvid=None,
+            audio_id=None,
+            no_cache=request.no_cache,
+            file_path_for_cache=full_file_path  # 传入完整路径用于缓存
+        )
+
+        return result
+
+    except Exception as e:
+        logger.error(f"网盘文件转录失败: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "type": config.subtitle_config["type"],
+            "version": config.subtitle_config["version"],
+            "body": [],
+            "rtf": 0.0
+        }
+
 if __name__ == "__main__":
     import uvicorn
 
     # 预加载模型，避免第一次请求延迟
     logger.info("启动时预加载模型...")
-    logger.info("注意：第一次运行时仍需要从 ModelScope 下载模型，请耐心等待...")
+    logger.info("注意：第一次运行时仍需要从 HuggingFace 下载模型，请耐心等待...")
     try:
         manager.load_model_if_needed()
         logger.info("预加载完成，服务器已就绪！")
@@ -297,6 +377,7 @@ if __name__ == "__main__":
 
     # 从配置获取API配置
     api_config = config.api_config
-    logger.info(f"启动服务器 http://{api_config['host']}:{api_config['port']}")
-    uvicorn.run(app, host=api_config["host"], port=api_config["port"])
+    reload = api_config.get("reload", False)
+    logger.info(f"启动服务器 http://{api_config['host']}:{api_config['port']}" + (" (自动重载已启用)" if reload else ""))
+    uvicorn.run(app, host=api_config["host"], port=api_config["port"], reload=reload)
     
