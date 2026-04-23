@@ -28,9 +28,11 @@
 **Files:**
 - Modify: `config.py:49-92`（非连续，需逐个删除指定属性）
 
-- [ ] **Step 1: 删除旧模型属性，添加新属性**
+- [ ] **Step 1: 删除旧属性，添加新属性**
 
-删除 `model_name`、`vad_model`、`punc_model`、`disable_update` 属性，删除 `batch_size_s`、`enable_timestamp`、`chinese_ratio_threshold` 属性。添加新属性：
+删除旧的模型属性：`model_name`、`vad_model`、`punc_model`、`disable_update`。删除旧的处理属性：`batch_size_s`、`enable_timestamp`、`chinese_ratio_threshold`。注意保留 `max_segment_length` 和 `duration_per_segment`。
+
+添加新属性：
 
 ```python
 @property
@@ -120,7 +122,7 @@ os.environ['HF_HOME'] = str(Path.home() / ".cache/huggingface")
 os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
 ```
 
-删除 `MODELSCOPE_CACHE` 相关行。
+删除 `MODELSCOPE_CACHE` 相关行。注意：保留第 6 行的 `import torch`，仅替换环境变量相关代码。
 
 - [ ] **Step 2: 删除 `_build_model_kwargs` 方法**
 
@@ -128,7 +130,7 @@ os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
 
 - [ ] **Step 3: 重写 `load_model_if_needed` 方法**
 
-将第 63-101 行的 `load_model_if_needed` 方法替换为：
+将第 63-101 行的 `load_model_if_needed` 方法替换为。注意：`unload_model` 方法（第 103-111 行）保持不变。
 
 ```python
 def load_model_if_needed(self):
@@ -430,7 +432,7 @@ git commit -m "docs: 更新启动脚本注释"
 ### Task 6: 更新 CLAUDE.md 项目文档
 
 **Files:**
-- Modify: `CLAUDE.md:7, 13, 55, 63, 68-70`
+- Modify: `CLAUDE.md:7, 55, 63, 68-70`
 
 - [ ] **Step 1: 更新项目描述**
 
