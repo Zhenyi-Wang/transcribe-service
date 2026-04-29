@@ -249,7 +249,12 @@ class QwenForcedAligner:
         # 2. 加载对齐 LLM
         self.model = llama.LlamaModel(llm_gguf, n_gpu_layers=-1, use_gpu=config.llm_use_gpu)
         self.embedding_table = llama.get_token_embeddings_gguf(llm_gguf)
-        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=2048, embeddings=False)
+
+        # 动态计算 n_batch：Aligner 每秒音频约 30 tokens，多平面位置编码需要 ×4
+        # chunk_size 默认 40s，需覆盖 chunk + text 余量
+        tokens_per_chunk = int(config.dml_pad_to * 30) if config.dml_pad_to else 1200
+        n_batch = max(2048, ((tokens_per_chunk * 4 + 2047) // 2048) * 2048)  # 向上对齐到 2048
+        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=n_batch, embeddings=False)
         
         self.processor = AlignerProcessor()
         self.ID_AUDIO_START = self.model.token_to_id("<|audio_start|>")

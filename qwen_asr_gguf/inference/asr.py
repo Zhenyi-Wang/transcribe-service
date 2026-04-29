@@ -54,7 +54,13 @@ class QwenASREngine:
         # 3. 加载识别 LLM
         self.model = llama.LlamaModel(llm_gguf, use_gpu=config.llm_use_gpu)
         self.embedding_table = llama.get_token_embeddings_gguf(llm_gguf)
-        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=4096, embeddings=False)
+
+        # 动态计算 n_batch：Qwen3 多平面位置编码需要 pos_arr = total_len × 4
+        # 每秒音频约 20 tokens，需覆盖 (memory_num + 1) 个 chunk + prefix/suffix 余量
+        tokens_per_chunk = int(config.chunk_size * 20)
+        total_max_tokens = tokens_per_chunk * (config.memory_num + 1) + 200
+        n_batch = max(4096, ((total_max_tokens * 4 + 4095) // 4096) * 4096)  # 向上对齐到 4096
+        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=n_batch, embeddings=False)
 
         # 缓存 Token ID
         self.ID_IM_START = self.model.token_to_id("<|im_start|>")
