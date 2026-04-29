@@ -90,7 +90,7 @@ if len(words) > MAX_ALIGN_WORDS:
 2. 调用 `self.gguf_writer.add_causal_attention(False)`
 3. 正确映射架构名称
 
-**已提交 PR**: https://github.com/ggml-org/llama.cpp/pull/22511
+**已提交 PR**: https://github.com/ggml-org/llama.cpp/pull/22511（已关闭）
 
 **关联 Issue**:
 - https://github.com/ggml-org/llama.cpp/issues/22357 — 转录重复/乱码
@@ -100,7 +100,13 @@ if len(words) > MAX_ALIGN_WORDS:
 
 **临时方案**: Python 代码中传入 `attention_type=1` 强制使用 non-causal attention（已实现）。
 
-**永久方案**: PR 合并后，重新转换的 GGUF 模型自带正确元数据，无需代码层 workaround。
+**PR 结果**: 被维护者 ngxson 拒绝，理由：
+1. PR #20746 是给 embedding 模型用的，不是 ASR
+2. Qwen3-ASR config.json 中没有信息表明需要 non-causal attention
+3. 音频输入不应该用 non-causal attention（除了 encoder-decoder 架构如 Whisper）
+4. 没有测试结果和官方参考代码
+
+**结论**: 不再追加争议。现有 Python 层 workaround 已解决实际问题。
 
 ## 封装原则
 
