@@ -4325,6 +4325,16 @@ class Qwen3Model(Qwen2Model):
         return super().modify_tensors(data_torch, name, bid)
 
 
+@ModelBase.register("Qwen3ASRForConditionalGeneration")
+class Qwen3ASRModel(Qwen3Model):
+    """Qwen3-ASR: Qwen3 变体，用于音频转录，需要 non-causal attention"""
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        # Qwen3-ASR 的音频编码需要 bidirectional attention
+        self.gguf_writer.add_causal_attention(False)
+
+
 @ModelBase.register("Qwen3MoeForCausalLM")
 class Qwen3MoeModel(Qwen2MoeModel):
     model_arch = gguf.MODEL_ARCH.QWEN3MOE
