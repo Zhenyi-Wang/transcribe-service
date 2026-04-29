@@ -90,6 +90,18 @@ if len(words) > MAX_ALIGN_WORDS:
 2. 调用 `self.gguf_writer.add_causal_attention(False)`
 3. 正确映射架构名称
 
+**已提交 PR**: https://github.com/ggml-org/llama.cpp/pull/22511
+
+**关联 Issue**:
+- https://github.com/ggml-org/llama.cpp/issues/22357 — 转录重复/乱码
+- https://github.com/ggml-org/llama.cpp/issues/21847 — 长音频空转录
+
+**根因**: Qwen3-ASR 的 HuggingFace config 不包含 `is_causal=False` 字段，导致转换后的 GGUF 模型继承 `causal_attn=true`，llama.cpp 据此限制 `n_batch = min(n_ctx, n_batch)`，长音频处理崩溃。
+
+**临时方案**: Python 代码中传入 `attention_type=1` 强制使用 non-causal attention（已实现）。
+
+**永久方案**: PR 合并后，重新转换的 GGUF 模型自带正确元数据，无需代码层 workaround。
+
 ## 封装原则
 
 | 层级 | 暴露什么 | 隐藏什么 |
@@ -97,3 +109,20 @@ if len(words) > MAX_ALIGN_WORDS:
 | 用户层 | `chunk_size`, `memory_chunks`, `use_gpu`, `system_prompt` | `n_batch`, `n_ubatch`, `n_ctx`, `attention_type`, 帧率 13 |
 | 引擎层 | 计算逻辑 | llama.cpp 细节 |
 | llama.cpp 层 | 全部参数 | — |
+
+## C 库（llama.cpp 预编译二进制）
+
+GGUF 后端依赖 llama.cpp 的 C 动态库，位于 `lib/` 目录（约 510M），已通过 `.gitignore` 排除，**不在 git 中**。
+
+**重要**：该目录丢失后服务无法启动，且无法从 git 恢复。需要重新获取预编译库。
+
+**相关文件**:
+- `lib/libllama.so` — 主推理库
+- `lib/libggml.so` / `lib/libggml-base.so` — 底层张量运算
+- `lib/libggml-cpu.so` / `lib/libggml-cuda.so` — CPU/CUDA 后端
+- `lib/libllama-common.so` — 公共工具
+
+**重新获取方式**: 从 llama.cpp 官方 release 下载或本地编译（需要 CUDA 工具链）。
+
+**上游仓库**: https://github.com/ggml-org/llama.cpp
+**本项目 fork**: https://github.com/Zhenyi-Wang/llama.cpp（用于提交 PR）
