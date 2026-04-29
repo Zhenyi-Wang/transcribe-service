@@ -1,5 +1,6 @@
 # coding=utf-8
 import os
+import sys
 import time
 import unicodedata
 import numpy as np
@@ -250,11 +251,13 @@ class QwenForcedAligner:
         self.model = llama.LlamaModel(llm_gguf, n_gpu_layers=-1, use_gpu=config.llm_use_gpu)
         self.embedding_table = llama.get_token_embeddings_gguf(llm_gguf)
 
-        # 动态计算 n_batch：Aligner 每秒音频约 30 tokens，多平面位置编码需要 ×4
-        # chunk_size 默认 40s，需覆盖 chunk + text 余量
-        tokens_per_chunk = int(config.dml_pad_to * 30) if config.dml_pad_to else 1200
-        n_batch = max(2048, ((tokens_per_chunk * 4 + 2047) // 2048) * 2048)  # 向上对齐到 2048
-        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=n_batch, embeddings=False)
+        # 动态计算 n_batch 和 n_ubatch：Aligner 每秒音频约 30 tokens，多平面位置编码需要 ×4
+        # 使用安全上限，覆盖极端情况（如噪声导致 ASR 产生大量文本）
+        # 40s 音频极端 n_total: 520(audio) + 3000(text+timestamps) ≈ 3520
+        n_batch = 32768   # 覆盖 n_total × 4 的极端场景
+        n_ubatch = 8192   # 覆盖 n_total 极端场景
+        # attention_type=1 强制使用 non-causal attention，避免 n_batch 被限制到 n_ctx
+        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=n_batch, n_ubatch=n_ubatch, embeddings=False, attention_type=1)
         
         self.processor = AlignerProcessor()
         self.ID_AUDIO_START = self.model.token_to_id("<|audio_start|>")
@@ -276,6 +279,13 @@ class QwenForcedAligner:
 
         # 2. 分词与构建 Prompt (必须完整注入音频序列)
         words = self.processor.tokenize(text, language)
+        # 防御性截断：当 ASR 遇到噪声时可能产生大量垃圾文本（如重复几百次无意义词），
+        # 导致 n_total = audio_embd + words_tokens + timestamps 超出 n_batch 安全上限而崩溃。
+        # 截断后被丢弃的词仍保留在转录文本中，仅缺少字级时间戳（退化为最后一个正常词的 end_time）。
+        MAX_ALIGN_WORDS = 600
+        if len(words) > MAX_ALIGN_WORDS:
+            logger.warning(f"[Aligner] 文本过长 ({len(words)} 词)，截断至 {MAX_ALIGN_WORDS}")
+            words = words[:MAX_ALIGN_WORDS]
         def tk(t): return self.model.tokenize(t)
         
         pre_ids = [self.ID_AUDIO_START]
@@ -314,11 +324,11 @@ class QwenForcedAligner:
         batch = llama.LlamaBatch(n_total * 4, embd_dim=1024)
         batch.set_embd(full_embd, pos=pos_arr)
         for idx in ts_positions: batch.logits[idx] = 1 # 只计算 timestamp 处的 logits 以提速
-        
+
         self.ctx.clear_kv_cache()
         self.ctx.decode(batch)
         t_dec = time.time() - t_dec_start
-        
+
         # 4. 解析结果
         raw_ts = []
         for idx in ts_positions:

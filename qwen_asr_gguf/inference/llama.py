@@ -200,6 +200,7 @@ def bind_llama_lib():
     global llama_batch_init, llama_batch_free, llama_batch_get_one
     global llama_decode, llama_get_logits, llama_get_logits_ith, llama_get_embeddings, llama_tokenize
     global llama_get_memory, llama_memory_clear, llama_model_n_embd
+    global llama_set_causal_attn
     global llama_vocab_n_tokens, llama_vocab_eos, llama_token_to_piece
     global llama_sampler_chain_default_params, llama_sampler_chain_init, llama_sampler_chain_add
     global llama_sampler_init_greedy, llama_sampler_init_dist, llama_sampler_init_temp
@@ -359,6 +360,11 @@ def bind_llama_lib():
     llama_memory_clear = llama.llama_memory_clear
     llama_memory_clear.argtypes = [ctypes.c_void_p, ctypes.c_bool]
     llama_memory_clear.restype = None
+
+    # Context config
+    llama_set_causal_attn = llama.llama_set_causal_attn
+    llama_set_causal_attn.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+    llama_set_causal_attn.restype = None
 
     # Sampler
     llama_sampler_chain_default_params = llama.llama_sampler_chain_default_params
@@ -520,9 +526,10 @@ class LlamaModel:
 
 class LlamaContext:
     """上下文的面向对象封装"""
-    def __init__(self, model, n_ctx=2048, n_batch=2048, n_ubatch=512, n_seq_max=1, 
-                 embeddings=False, pooling_type=0, flash_attn=True, 
-                 offload_kqv=True, no_perf=True, n_threads=None, n_threads_batch=None):
+    def __init__(self, model, n_ctx=2048, n_batch=2048, n_ubatch=512, n_seq_max=1,
+                 embeddings=False, pooling_type=0, flash_attn=True,
+                 offload_kqv=True, no_perf=True, n_threads=None, n_threads_batch=None,
+                 attention_type=-1):  # -1=UNSPECIFIED, 0=CAUSAL, 1=NON_CAUSAL
         self.model = model # 保持模型引用防止被释放
         params = llama_context_default_params()
         params.n_ctx = n_ctx
@@ -534,6 +541,7 @@ class LlamaContext:
         params.flash_attn_type = 1 if flash_attn else 0
         params.offload_kqv = offload_kqv
         params.no_perf = no_perf
+        params.attention_type = attention_type
         
         # 线程配置
         cpu_count = os.cpu_count() or 4

@@ -54,12 +54,13 @@ GGUF 后端在 `backends/gguf_backend.py` 之上还有 `qwen_asr_gguf/` 包（ON
 
 GGUF 量化版本通过 `backend.gguf.asr_precision` 控制：`f16` / `q8_0` / `q4_k` / `q4_k_m`。模型文件位于 `~/models/qwen3-asr-gguf/`。
 
-**GGUF n_batch 动态计算**：Qwen3-ASR 使用多平面位置编码，`llama_decode` 需要 `pos_arr = total_len × 4` 个位置槽位。为避免 `GGML_ASSERT(n_tokens_all <= n_batch)` 崩溃，`n_batch` 根据实际 token 需求动态计算：
+**GGUF n_batch/n_ubatch/attention_type**：Qwen3-ASR 使用多平面位置编码 + non-causal attention，需要三个参数配合：
 
-- ASR: `n_batch ≥ (chunk_size × 20 × (memory_num + 1) + 200) × 4`
-- Aligner: `n_batch ≥ (dml_pad_to × 30) × 4`
+1. **n_batch**：覆盖 `pos_arr` 长度（`total_len × 4`），避免 `GGML_ASSERT(n_tokens_all <= n_batch)` 崩溃
+2. **n_ubatch**：覆盖 `total_len`，避免 `GGML_ASSERT(n_ubatch >= n_tokens_all)` 崩溃（non-causal attention 要求）
+3. **attention_type=1**（NON_CAUSAL）：Qwen3-ASR GGUF 模型被错误映射为 `qwen3vl` 架构（causal_attn=true），必须在创建 Context 时传入 `attention_type=1` 强制使用 non-causal attention，否则 `n_batch` 会被 llama.cpp 限制到 `n_ctx`（2048）导致长音频崩溃
 
-代码位于 `qwen_asr_gguf/inference/asr.py` 和 `aligner.py`，自动向上对齐到 4096/2048。
+详细分析和计算公式见 `system_docs/gguf-param-optimization.md`。代码位于 `qwen_asr_gguf/inference/asr.py`、`aligner.py` 和 `llama.py`。
 
 **配置迁移（v1 → v2）**：旧版 `model.*` 顶层字段已移除，需改为 `backend` 分组结构：
 ```yaml

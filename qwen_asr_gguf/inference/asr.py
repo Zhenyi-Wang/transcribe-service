@@ -1,5 +1,6 @@
 # coding=utf-8
 import os
+import sys
 import time
 import re
 import codecs
@@ -55,12 +56,16 @@ class QwenASREngine:
         self.model = llama.LlamaModel(llm_gguf, use_gpu=config.llm_use_gpu)
         self.embedding_table = llama.get_token_embeddings_gguf(llm_gguf)
 
-        # 动态计算 n_batch：Qwen3 多平面位置编码需要 pos_arr = total_len × 4
-        # 每秒音频约 20 tokens，需覆盖 (memory_num + 1) 个 chunk + prefix/suffix 余量
-        tokens_per_chunk = int(config.chunk_size * 20)
-        total_max_tokens = tokens_per_chunk * (config.memory_num + 1) + 200
-        n_batch = max(4096, ((total_max_tokens * 4 + 4095) // 4096) * 4096)  # 向上对齐到 4096
-        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=n_batch, embeddings=False)
+        # 动态计算 n_batch 和 n_ubatch：Qwen3 多平面位置编码需要 pos_arr = total_len × 4
+        # 每秒音频约 13 embedding frames，需覆盖 (memory_num + 1) 个 chunk + prefix/suffix 余量
+        frames_per_chunk = int(config.chunk_size * 13)
+        total_max_frames = frames_per_chunk * (config.memory_num + 1) + 500  # 500 for prefix/suffix tokens
+        # n_batch 需要覆盖 pos_arr 长度 (total_len × 4)
+        n_batch = max(4096, ((total_max_frames * 4 + 4095) // 4096) * 4096)  # 向上对齐到 4096
+        # n_ubatch 需要覆盖 total_len (non-causal attention 要求 n_ubatch >= n_tokens_all)
+        n_ubatch = max(512, ((total_max_frames + 511) // 512) * 512)  # 向上对齐到 512
+        # attention_type=1 强制使用 non-causal attention，避免 n_batch 被限制到 n_ctx
+        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=n_batch, n_ubatch=n_ubatch, embeddings=False, attention_type=1)
 
         # 缓存 Token ID
         self.ID_IM_START = self.model.token_to_id("<|im_start|>")
@@ -113,9 +118,10 @@ class QwenASREngine:
         total_len = full_embd.shape[0]
         pos_base = np.arange(0, total_len, dtype=np.int32)
         pos_arr = np.concatenate([pos_base, pos_base, pos_base, np.zeros(total_len, dtype=np.int32)])
+
         batch = llama.LlamaBatch(max(total_len * 4, 8192), self.model.n_embd, 1)
         batch.set_embd(full_embd, pos=pos_arr)
-        
+
         # 1. Prefill
         self.ctx.clear_kv_cache()
         t_pre_start = time.time()
