@@ -256,8 +256,13 @@ class QwenForcedAligner:
         # 40s 音频极端 n_total: 520(audio) + 3000(text+timestamps) ≈ 3520
         n_batch = 32768   # 覆盖 n_total × 4 的极端场景
         n_ubatch = 8192   # 覆盖 n_total 极端场景
-        # attention_type=1 强制使用 non-causal attention，避免 n_batch 被限制到 n_ctx
-        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=n_batch, n_ubatch=n_ubatch, embeddings=False, attention_type=1)
+        # causal attention (attention_type=0)：Qwen3-ASR 需要 causal attention
+        # causal 模式下 n_batch 被 llama.cpp 限制到 min(n_ctx, n_batch)
+        # 因此 n_ctx 必须足够大以容纳 n_batch
+        required_ctx = n_batch + 4096
+        if config.n_ctx < required_ctx:
+            config.n_ctx = required_ctx
+        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=n_batch, n_ubatch=n_ubatch, embeddings=False, attention_type=0)
         
         self.processor = AlignerProcessor()
         self.ID_AUDIO_START = self.model.token_to_id("<|audio_start|>")

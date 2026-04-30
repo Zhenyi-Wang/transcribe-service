@@ -54,11 +54,11 @@ GGUF 后端在 `backends/gguf_backend.py` 之上还有 `qwen_asr_gguf/` 包（ON
 
 GGUF 量化版本通过 `backend.gguf.asr_precision` 控制：`f16` / `q8_0` / `q4_k` / `q4_k_m`。模型文件位于 `~/models/qwen3-asr-gguf/`。
 
-**GGUF n_batch/n_ubatch/attention_type**：Qwen3-ASR 使用多平面位置编码 + non-causal attention，需要三个参数配合：
+**GGUF n_batch/n_ubatch/n_ctx**：Qwen3-ASR 使用多平面位置编码 + causal attention，需要三个参数配合：
 
 1. **n_batch**：覆盖 `pos_arr` 长度（`total_len × 4`），避免 `GGML_ASSERT(n_tokens_all <= n_batch)` 崩溃
-2. **n_ubatch**：覆盖 `total_len`，避免 `GGML_ASSERT(n_ubatch >= n_tokens_all)` 崩溃（non-causal attention 要求）
-3. **attention_type=1**（NON_CAUSAL）：Qwen3-ASR GGUF 模型被错误映射为 `qwen3vl` 架构（causal_attn=true），必须在创建 Context 时传入 `attention_type=1` 强制使用 non-causal attention，否则 `n_batch` 会被 llama.cpp 限制到 `n_ctx`（2048）导致长音频崩溃
+2. **n_ubatch**：覆盖 `total_len`，避免 `GGML_ASSERT(n_ubatch >= n_tokens_all)` 崩溃
+3. **n_ctx**：causal 模式下 llama.cpp 会将 `n_batch` 限制到 `min(n_ctx, n_batch)`，因此 `n_ctx` 必须自动调大到 `n_batch + 4096` 以容纳 mrope 四平面位置编码
 
 详细分析和计算公式见 `system_docs/gguf-param-optimization.md`。代码位于 `qwen_asr_gguf/inference/asr.py`、`aligner.py` 和 `llama.py`。
 

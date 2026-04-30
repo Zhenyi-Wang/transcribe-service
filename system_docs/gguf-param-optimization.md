@@ -22,22 +22,21 @@ n_batch ≥ total_len × 4
 n_ubatch ≥ total_len
 ```
 
-## 关键发现：causal_attn 导致 n_batch 被限制
+## 关键发现：causal attention 是必需的
 
-**问题**：Qwen3-ASR GGUF 模型被错误映射到 `qwen3vl` 架构，元数据中 `causal_attn=true`。llama.cpp 在初始化 Context 时：
+**事实**：Qwen3-ASR GGUF 模型被映射到 `qwen3vl` 架构，元数据中 `causal_attn=true`。**这是正确的**——实测验证 causal attention 才能正常转录，non-causal attention 会导致输出完全乱码或空。
+
+llama.cpp 在 causal 模式下的限制：
 
 ```cpp
 cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 ```
 
-当 `causal_attn=true` 时，`n_batch` 被限制到 `n_ctx=2048`，导致长音频处理崩溃。
+当 `causal_attn=true` 时，`n_batch` 被限制到 `n_ctx`。因此 **必须自动调大 `n_ctx`** 以容纳 mrope 四平面位置编码（`total_len × 4`）。
 
-**根因**：
-1. GGUF 转换脚本没有 Qwen3-ASR 的专用处理
-2. 原始 HF 模型配置中没有 `causal` 字段，需要根据用途推断
-3. Qwen3-ASR 用于音频转录，需要 bidirectional attention（non-causal）
+**错误的历史结论**：之前认为"Qwen3-ASR 需要 non-causal attention"是基于错误的推理。实际上"长音频崩溃"是 `n_ctx` 太小导致的，而非 causal attention 本身的问题。向 llama.cpp 提交的 PR #22511 也被维护者正确拒绝。
 
-**修复**：创建 Context 时传入 `attention_type=1`（NON_CAUSAL），强制关闭 causal attention。
+**修复**：使用 `attention_type=0`（CAUSAL），并自动将 `n_ctx` 调大到 `n_batch + 4096`。
 
 ## 当前实现
 
@@ -106,7 +105,7 @@ if len(words) > MAX_ALIGN_WORDS:
 3. 音频输入不应该用 non-causal attention（除了 encoder-decoder 架构如 Whisper）
 4. 没有测试结果和官方参考代码
 
-**结论**: 不再追加争议。现有 Python 层 workaround 已解决实际问题。
+**后续验证**: 维护者的判断是正确的。实测证明 causal attention 才是正确的，non-causal attention 导致完全乱码。之前的 workaround（`attention_type=1`）解决了"长音频崩溃"但引入了"所有音频乱码"的严重问题。正确的做法是保持 causal attention 并增大 `n_ctx`。
 
 ## 封装原则
 
