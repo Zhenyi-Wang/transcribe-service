@@ -83,30 +83,78 @@ class QwenASREngine:
         if self.verbose: print("--- [QwenASR] 引擎已关闭 ---")
 
     def _build_prompt_embd(self, audio_embd: np.ndarray, prefix_text: str, context: Optional[str], language: Optional[str]):
-        """构造用于 LLM 输入的 Embedding 序列 (区块化打包模式)"""
+        """构造用于 LLM 输入的 Embedding 序列 (区块化打包模式)
+
+        language 为 None 时进入自动检测模式：不添加 <asr_text> 到 prompt，
+        模型会自行输出 "language X\\n<asr_text>text" 格式，由 _parse_asr_output 解析。
+        language 有值时进入强制模式：prompt 中包含 "language X<asr_text>"，
+        模型直接输出纯文本。
+        """
         def tk(t): return self.model.tokenize(t)
 
         # 1. 区块 A: 音频之前的所有内容 (System + User Header)
         prefix_str = f"system\n{context or 'You are a helpful assistant.'}"
         prefix_tokens = [self.ID_IM_START] + tk(prefix_str) + [self.ID_IM_END] + \
                         [self.ID_IM_START] + tk("user\n") + [self.ID_AUDIO_START]
-        
+
         # 2. 区块 B: 音频之后的所有内容 (Instruction + Assistant Header + History)
         suffix_head = f"assistant\n"
         if language: suffix_head += f"language {language}"
-        
+
         suffix_tokens = [self.ID_AUDIO_END] + [self.ID_IM_END] + \
-                        [self.ID_IM_START] + tk(suffix_head) + [self.ID_ASR_TEXT] + tk(prefix_text)
+                        [self.ID_IM_START] + tk(suffix_head)
+        if language:
+            # 强制语言模式：<asr_text> 在 prompt 中，模型直接输出文本
+            suffix_tokens += [self.ID_ASR_TEXT]
+        suffix_tokens += tk(prefix_text)
 
         # 3. 统计并拼接
         n_pre, n_aud, n_suf = len(prefix_tokens), audio_embd.shape[0], len(suffix_tokens)
         total_embd = np.zeros((n_pre + n_aud + n_suf, self.model.n_embd), dtype=np.float32)
-        
+
         total_embd[:n_pre] = self.embedding_table[prefix_tokens]
         total_embd[n_pre : n_pre + n_aud] = audio_embd
         total_embd[n_pre + n_aud:] = self.embedding_table[suffix_tokens]
-        
+
         return total_embd
+
+    @staticmethod
+    def _parse_asr_output(raw: str, user_language: Optional[str] = None):
+        """解析模型输出，提取 (language, text)
+
+        user_language 非空时（强制模式），模型输出为纯文本，直接返回。
+        user_language 为空时（自动检测），模型输出格式为
+        "language X\\n<asr_text>transcription"，从中提取语言和文本。
+
+        Returns:
+            Tuple[str, str]: (language, text)，language 可能为空字符串表示未识别
+        """
+        if raw is None:
+            return "", ""
+        s = str(raw).strip()
+        if not s:
+            return "", ""
+
+        if user_language:
+            return user_language, s
+
+        ASR_TEXT_TAG = "<asr_text>"
+        if ASR_TEXT_TAG in s:
+            meta_part, text_part = s.split(ASR_TEXT_TAG, 1)
+        else:
+            # 无 tag，整个输出视为文本
+            return "", s.strip()
+
+        lang = ""
+        for line in meta_part.splitlines():
+            line = line.strip()
+            if line.lower().startswith("language "):
+                val = line[len("language "):].strip()
+                if val:
+                    lang = normalize_language_name(val)
+                break
+
+        return lang, text_part.strip()
 
     def _decode(
         self, 
@@ -257,7 +305,7 @@ class QwenASREngine:
         )
 
     def asr(
-        self, 
+        self,
         audio: np.ndarray,
         context: Optional[str],
         language: Optional[str],
@@ -266,7 +314,13 @@ class QwenASREngine:
         temperature: float = 0.4,
         rollback_num: int = 5
     ) -> TranscribeResult:
-        """运行完整转录流水线 (三级流水线：i+1 预取, i 识别, i-1 对齐)"""
+        """运行完整转录流水线 (三级流水线：i+1 预取, i 识别, i-1 对齐)
+
+        语言检测策略：
+        - language 有值时：全部 chunk 使用强制语言模式（prompt 含 "language X<asr_text>"）
+        - language 为 None：首个 chunk 使用自动检测模式（prompt 不含 <asr_text>），
+          从模型输出中解析语言；后续 chunk 切换到强制模式使用检测到的语言。
+        """
         # 语言归一化与校验
         if language:
             language = normalize_language_name(language)
@@ -277,7 +331,7 @@ class QwenASREngine:
         total_len = len(audio)
         num_chunks = int(np.ceil(total_len / samples_per_chunk))
         total_duration = total_len / sr
-        
+
         # 记忆管理 (预定义所有分片的物理边界)
         all_segments: List[ASRS_Segment] = [
             ASRS_Segment(
@@ -289,7 +343,7 @@ class QwenASREngine:
         asr_memory = deque(maxlen=memory_chunks) # 存储 (embd, text)
         total_full_text = ""
         all_aligned_items: List[ForcedAlignItem] = []
-        
+
         # 统计指标
         stats = {
             "prefill_time": 0.0, "decode_time": 0.0,
@@ -298,46 +352,58 @@ class QwenASREngine:
         }
         t_main_start = time.time()
 
+        # 语言检测状态：初始为用户提供的 language（可能为 None）
+        detected_language = language
+
         # --- 顺序同步处理循环 ---
         for i in range(num_chunks):
             # 1. 编码第 i 片段
             s, e = i * samples_per_chunk, min((i + 1) * samples_per_chunk, total_len)
             chunk_data = audio[s:e]
-            if len(chunk_data) < samples_per_chunk: 
+            if len(chunk_data) < samples_per_chunk:
                 chunk_data = np.pad(chunk_data, (0, samples_per_chunk - len(chunk_data)))
-            
+
             audio_feature, enc_time = self.encoder.encode(chunk_data)
             stats["encode_time"] += enc_time
             was_last = (i == num_chunks - 1)
 
             # 2. 识别第 i 片段文字
+            # 首 chunk 自动检测，后续 chunk 使用已检测到的语言
+            effective_language = detected_language
             prefix_text = "".join([m[1] for m in asr_memory])
             combined_audio = np.concatenate([m[0] for m in asr_memory] + [audio_feature], axis=0)
-            full_embd = self._build_prompt_embd(combined_audio, prefix_text, context, language)
-            
+            full_embd = self._build_prompt_embd(combined_audio, prefix_text, context, effective_language)
+
             # 带熔断加温重试的解码调用
             res = self._safe_decode(full_embd, prefix_text, rollback_num, was_last, temperature)
 
-            # 更新记忆与统计
-            all_segments[i].text = res.text
-            asr_memory.append((audio_feature, res.text))
-            
-            total_full_text += res.text
+            # 解析输出：自动检测模式下首 chunk 需提取语言
+            chunk_lang, chunk_text = self._parse_asr_output(res.text, user_language=effective_language)
+            if not detected_language and chunk_lang:
+                detected_language = chunk_lang
+                if self.verbose:
+                    print(f"\n[语言检测] 自动检测到语言: {detected_language}")
+
+            # 更新记忆与统计（仅存储纯文本，不含语言元数据）
+            all_segments[i].text = chunk_text
+            asr_memory.append((audio_feature, chunk_text))
+
+            total_full_text += chunk_text
             stats["prefill_tokens"] += res.n_prefill; stats["prefill_time"] += res.t_prefill
             stats["decode_tokens"] += res.n_generate; stats["decode_time"] += res.t_generate
 
             # 3. 对齐第 i 片段 (同步)
-            if self.aligner and res.text.strip():
+            if self.aligner and chunk_text.strip():
                 t_align_start = time.time()
                 # 计算偏移（同步版本逻辑简化：直接使用片起点，不考虑前片动态边界）
                 offset_sec = all_segments[i].audio_start
                 s_smpl, e_smpl = int(offset_sec * sr), int(all_segments[i].audio_end * sr)
                 audio_slice = audio[s_smpl:e_smpl]
-                
+
                 align_res = self.aligner.align(
-                    audio_slice, 
-                    res.text, 
-                    language=language, 
+                    audio_slice,
+                    chunk_text,
+                    language=detected_language,
                     offset_sec=float(offset_sec)
                 )
                 all_segments[i].items = align_res.items
@@ -348,9 +414,10 @@ class QwenASREngine:
         all_aligned_items.sort(key=lambda x: x.start_time)
         t_total = time.time() - t_main_start
         if self.verbose: self._print_stats(stats, total_duration, t_total)
-            
+
         return TranscribeResult(
             text=total_full_text,
+            language=detected_language or "",
             alignment=ForcedAlignResult(items=all_aligned_items) if all_aligned_items else None,
             performance=stats
         )

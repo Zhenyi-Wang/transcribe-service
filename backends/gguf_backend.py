@@ -88,7 +88,7 @@ class GGUFBackend(ASRBackend):
 
         # 检测语言
         detected_lang = "zh"
-        if hasattr(result, "language") and result.language:
+        if result.language:
             from transcribe import LANG_MAP
             detected_lang = LANG_MAP.get(result.language, "zh")
 

@@ -110,5 +110,6 @@ class ASREngineConfig:
 class TranscribeResult:
     """ASR 转录结果 (含可选的对齐信息)"""
     text: str
+    language: str = ""  # 检测到的语言，如 "Chinese", "English"。自动检测模式下由模型输出解析得到
     alignment: Optional[ForcedAlignResult] = None
     performance: Optional[dict] = None
