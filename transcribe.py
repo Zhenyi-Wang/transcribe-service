@@ -244,12 +244,13 @@ def generate_subtitle_segments(text, asr_result=None):
 
     return body
 
-def generate_subtitle_segments_from_timestamps(text: str, timestamps: list) -> list:
+def generate_subtitle_segments_from_timestamps(text: str, timestamps: list, lang: str = "zh") -> list:
     """从统一格式的时间戳生成字幕段落
 
     Args:
         text: 转录文本（含标点）
         timestamps: 时间戳列表，格式为 [{"text": str, "start": float, "end": float}, ...]
+        lang: 检测到的语言代码（zh/en/ja/ko 等），用于决定空格处理策略
 
     字级时间戳（GGUF/Qwen3-ASR，每段1字）需要按标点合并为短语；
     句级时间戳（FunASR，每段已是短语）直接使用。
@@ -264,31 +265,15 @@ def generate_subtitle_segments_from_timestamps(text: str, timestamps: list) -> l
     if avg_len <= 2:
         return _merge_char_timestamps(text, timestamps)
 
-    # 句级时间戳直接使用，但合并过短段落
-    min_len = 5
-    body = []
-    for ts in timestamps:
-        seg_text = ts.get("text", "").strip()
-        if not seg_text:
-            continue
-        if body and len(seg_text) < min_len:
-            body[-1]["content"] += seg_text
-            body[-1]["to"] = round(ts.get("end", 0), 2)
-        else:
-            body.append({
-                "from": round(ts.get("start", 0), 2),
-                "to": round(ts.get("end", 0), 2),
-                "sid": 0,
-                "location": 2,
-                "content": seg_text,
-                "music": 0
-            })
+    # CJK 语言不使用空格分词，其他语言（英法德西等）使用空格
+    _CJK_LANGS = {"zh", "ja", "ko", "yue", ""}
+    use_spaces = lang not in _CJK_LANGS
 
-    # 重新编号
-    for i, seg in enumerate(body):
-        seg["sid"] = i + 1
-
-    return body if body else generate_subtitle_segments(text)
+    if use_spaces:
+        return _segment_by_punctuation(timestamps, text)
+    else:
+        # 非空格语言（日/韩）：简单按 min_len 合并，不关注空格
+        return _segment_simple(timestamps, text)
 
 
 def _merge_char_timestamps(text: str, timestamps: list) -> list:
@@ -362,6 +347,114 @@ def _merge_char_timestamps(text: str, timestamps: list) -> list:
             })
 
         ts_offset = end_idx + 1
+
+    return body if body else generate_subtitle_segments(text)
+
+
+def _segment_simple(timestamps: list, text: str) -> list:
+    """非空格语言（日/韩）的简单合并：按 min_len 合并短词，不处理空格"""
+    min_len = 5
+    body = []
+    for ts in timestamps:
+        seg_text = ts.get("text", "").strip()
+        if not seg_text:
+            continue
+        if body and len(seg_text) < min_len:
+            body[-1]["content"] += seg_text
+            body[-1]["to"] = round(ts.get("end", 0), 2)
+        else:
+            body.append({
+                "from": round(ts.get("start", 0), 2),
+                "to": round(ts.get("end", 0), 2),
+                "sid": 0,
+                "location": 2,
+                "content": seg_text,
+                "music": 0
+            })
+    for i, seg in enumerate(body):
+        seg["sid"] = i + 1
+    return body if body else generate_subtitle_segments(text)
+
+
+def _segment_by_punctuation(timestamps: list, text: str) -> list:
+    """空格分隔语言的标点感知分段
+
+    积累单词直到遇到句末标点（.!?）后 flush 一个段落；
+    段落过长时在逗号/分号（,;:）处 flush；
+    无标点的超长段落按 max_len*3 强制 flush 避免单段过长。
+    单独标点项（",", "." 等）总是附加到当前段落，不独立成段。
+    """
+    import re
+    max_len = config.max_segment_length
+
+    body = []
+    # current_words: [(word_text, start_time, end_time)]
+    # word_text 对于段首词不含前置空格，后续词含前置空格
+    current_words = []
+    pending_space = False
+
+    def _flush():
+        if not current_words:
+            return
+        content = "".join(w[0] for w in current_words)
+        body.append({
+            "from": round(current_words[0][1], 2),
+            "to": round(current_words[-1][2], 2),
+            "sid": 0,
+            "location": 2,
+            "content": content,
+            "music": 0
+        })
+        current_words.clear()
+
+    def _is_punct_only(s: str) -> bool:
+        return all(c in '.!?,;:\'"()-' for c in s)
+
+    for ts in timestamps:
+        raw_text = ts.get("text", "")
+        seg_text = raw_text.strip()
+        if not seg_text:
+            if raw_text:
+                pending_space = True
+            continue
+
+        # 单独标点项：总是附加到当前段落，不出现在段首
+        if _is_punct_only(seg_text):
+            if current_words:
+                current_words.append((seg_text, ts.get("start", 0), ts.get("end", 0)))
+                # 句末标点触发 flush，确保 "ID." 之类不被拆散
+                if seg_text in '.!?':
+                    _flush()
+            # 如果 current_words 为空，这是段首标点（如 " ."），丢弃
+            pending_space = raw_text.rstrip() != raw_text
+            continue
+
+        # 构建词文本：段首词无前置空格，后续词根据 pending_space 决定
+        word_text = (" " if pending_space and current_words else "") + seg_text
+        start = ts.get("start", 0)
+        end = ts.get("end", 0)
+
+        current_words.append((word_text, start, end))
+        total_len = sum(len(w[0]) for w in current_words)
+
+        stripped = seg_text
+        ends_sentence = stripped.endswith(('.', '!', '?'))
+        ends_clause = stripped.endswith((',', ';', ':'))
+
+        if ends_sentence:
+            _flush()
+        elif ends_clause and total_len >= max_len:
+            _flush()
+        elif total_len >= max_len * 3:
+            # 无标点超长段强制 flush
+            _flush()
+
+        pending_space = raw_text.rstrip() != raw_text
+
+    _flush()
+
+    for i, seg in enumerate(body):
+        seg["sid"] = i + 1
 
     return body if body else generate_subtitle_segments(text)
 
@@ -478,7 +571,7 @@ class TranscriptionService:
             # 4. 生成字幕格式
             subtitle_start = time.time()
             if timestamps:
-                subtitle_body = generate_subtitle_segments_from_timestamps(transcript_text, timestamps)
+                subtitle_body = generate_subtitle_segments_from_timestamps(transcript_text, timestamps, detected_lang)
             else:
                 subtitle_body = generate_subtitle_segments(transcript_text)
             timing["subtitle_generate"] = time.time() - subtitle_start
