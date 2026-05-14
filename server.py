@@ -286,16 +286,24 @@ async def transcribe_webdav_file(request: WebdavTranscribeRequest):
 
     logger.info(f"网盘文件转录: {request.path} -> {full_file_path}")
 
-    # 检查文件是否存在
+    # 检查文件是否存在，不存在时尝试 inbox -> processed 回退
     if not os.path.exists(full_file_path):
-        return {
-            "status": "error",
-            "message": f"文件不存在: {request.path}",
-            "type": config.subtitle_config["type"],
-            "version": config.subtitle_config["version"],
-            "body": [],
-            "rtf": 0.0
-        }
+        if relative_path.startswith('inbox/'):
+            fallback_path = 'processed/' + relative_path[len('inbox/'):]
+            fallback_full_path = os.path.join(webdav_base, fallback_path)
+            logger.info(f"inbox 文件不存在，尝试 processed 回退: {fallback_full_path}")
+            if os.path.exists(fallback_full_path):
+                relative_path = fallback_path
+                full_file_path = fallback_full_path
+        if not os.path.exists(full_file_path):
+            return {
+                "status": "error",
+                "message": f"文件不存在: {request.path}",
+                "type": config.subtitle_config["type"],
+                "version": config.subtitle_config["version"],
+                "body": [],
+                "rtf": 0.0
+            }
 
     # 检查是否是文件
     if not os.path.isfile(full_file_path):
