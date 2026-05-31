@@ -11,6 +11,9 @@ conda activate funasr
 # 2. 进入脚本所在目录
 cd "$(dirname "$0")"
 
+# 设置 llama.cpp 共享库路径（libggml.so 依赖带版本号的 .so.0）
+export LD_LIBRARY_PATH="$(pwd)/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 # 3. 启动 Python 服务（默认启用自动重载）
 # 使用 --no-reload 禁用自动重载
 if [ "$1" == "--no-reload" ]; then
