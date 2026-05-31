@@ -33,6 +33,7 @@ class ModelManager:
         self._backend = None
         self.lock = threading.Lock()
         self.last_active_time = 0
+        self._in_use = 0
 
     def load_model_if_needed(self):
         """按需加载模型"""
@@ -44,8 +45,12 @@ class ModelManager:
                     from backends import BackendFactory
                     self._backend = BackendFactory.create(config)
                     logger.info(f"正在加载后端: {self._backend.name}...")
-                    self._backend.load()
-                    logger.info(f"后端加载成功！设备: {self._backend.device}")
+                    try:
+                        self._backend.load()
+                        logger.info(f"后端加载成功！设备: {self._backend.device}")
+                    except Exception:
+                        self._backend = None
+                        raise
 
         return self._backend
 
@@ -56,6 +61,19 @@ class ModelManager:
                 logger.info(f"闲置超时，释放后端资源: {self._backend.name}...")
                 self._backend.unload()
                 self._backend = None
+
+    def acquire(self):
+        """标记模型正在使用"""
+        self._in_use += 1
+
+    def release(self):
+        """标记模型使用完毕"""
+        self._in_use = max(0, self._in_use - 1)
+
+    @property
+    def in_use(self):
+        """是否有转录任务正在使用模型"""
+        return self._in_use > 0
 
     @property
     def backend(self):
@@ -131,7 +149,7 @@ class WebdavTranscribeRequest(BaseModel):
 def monitor_loop():
     while True:
         time.sleep(config.check_interval)
-        if manager._backend is not None:
+        if manager._backend is not None and not manager.in_use:
             if time.time() - manager.last_active_time > config.idle_timeout:
                 manager.unload_model()
 

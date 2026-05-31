@@ -1,5 +1,6 @@
 import time
 import os
+import asyncio
 import subprocess
 from pathlib import Path
 from config import config
@@ -522,6 +523,7 @@ class TranscriptionService:
                 "timing": timing
             }
 
+        self.model_manager.acquire()
         try:
             # 2. 获取音频时长
             filename_to_log = original_filename or audio_file_path
@@ -535,9 +537,9 @@ class TranscriptionService:
 
             logger.info(f"开始识别: {filename_to_log}")
 
-            # 3. 调用后端转录
+            # 3. 调用后端转录（在独立线程执行，避免阻塞事件循环）
             transcription_start_time = time.time()
-            result = backend.transcribe(audio_file_path)
+            result = await asyncio.to_thread(backend.transcribe, audio_file_path)
             processing_time = time.time() - transcription_start_time
             timing["transcription"] = processing_time
 
@@ -653,3 +655,6 @@ class TranscriptionService:
                 "rtf": round(rtf_ratio, 3),
                 "timing": {k: round(v, 3) for k, v in timing.items()}
             }
+
+        finally:
+            self.model_manager.release()
