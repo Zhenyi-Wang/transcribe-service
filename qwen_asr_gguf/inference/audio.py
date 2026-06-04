@@ -90,6 +90,21 @@ def check_ffmpeg():
     return shutil.which('ffmpeg') is not None
 
 
+def _probe_duration(audio_path):
+    """用 ffprobe 获取音频时长（秒），失败返回 None"""
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', str(audio_path)],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
 def load_audio_ffmpeg(audio_path, sample_rate=24000, start_second=None, duration=None):
     """使用 ffmpeg 直接读取音频"""
     if not check_ffmpeg():
@@ -109,6 +124,10 @@ def load_audio_ffmpeg(audio_path, sample_rate=24000, start_second=None, duration
         'pipe:1'
     ])
 
+    # 超时保护：ffmpeg 解码通常 10-100x 实时，音频时长 / 20 已经非常宽裕
+    audio_dur = _probe_duration(audio_path)
+    ffmpeg_timeout = max(30, (audio_dur or 600) / 20)
+
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -116,7 +135,14 @@ def load_audio_ffmpeg(audio_path, sample_rate=24000, start_second=None, duration
         bufsize=0
     )
 
-    raw_bytes, stderr = process.communicate()
+    try:
+        raw_bytes, stderr = process.communicate(timeout=ffmpeg_timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        raise RuntimeError(
+            f"ffmpeg 超时（{ffmpeg_timeout:.0f}秒），音频文件可能损坏: {audio_path}"
+        )
 
     if process.returncode != 0:
         error_msg = stderr.decode('utf-8', errors='ignore')

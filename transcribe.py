@@ -617,6 +617,15 @@ class TranscriptionService:
             if "out of memory" in str(e).lower():
                 self.model_manager.unload_model()
 
+            # ffmpeg 超时通常意味着音频文件损坏，删除缓存避免重复踩坑
+            if "ffmpeg 超时" in str(e):
+                try:
+                    if os.path.exists(audio_file_path):
+                        os.remove(audio_file_path)
+                        logger.warning(f"已删除疑似损坏的缓存文件: {audio_file_path}")
+                except Exception:
+                    pass
+
             audio_duration = 0.0
             if 'audio_duration' in locals():
                 audio_duration = locals()['audio_duration']
