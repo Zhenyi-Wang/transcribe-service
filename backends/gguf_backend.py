@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import io
+import threading
 import contextlib
 from typing import Optional, List, Dict, Any
 
@@ -16,6 +17,7 @@ class GGUFBackend(ASRBackend):
         self.config = config
         self._engine = None
         self._device = "cpu"
+        self._transcribe_lock = threading.Lock()
 
     @property
     def name(self) -> str:
@@ -65,14 +67,19 @@ class GGUFBackend(ASRBackend):
             self._engine = None
 
     def transcribe(self, audio_file: str, language: str = None) -> TranscribeResult:
-        """执行转录"""
+        """执行转录（互斥，防止并发访问 llama.cpp 导致段错误）"""
         if not self._engine:
             raise RuntimeError("模型未加载，请先调用 load()")
 
-        t_start = time.time()
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = self._engine.transcribe(audio_file, language=language)
-        t_total = time.time() - t_start
+        if not self._transcribe_lock.acquire(blocking=True, timeout=3600):
+            raise RuntimeError("转录排队超时（前一个任务占用超过 3600 秒）")
+        try:
+            t_start = time.time()
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = self._engine.transcribe(audio_file, language=language)
+            t_total = time.time() - t_start
+        finally:
+            self._transcribe_lock.release()
 
         # 转换时间戳格式
         timestamps = None
