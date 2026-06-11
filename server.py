@@ -133,6 +133,7 @@ class BilibiliTranscribeRequest(BaseModel):
     bvid: str
     cookie: str
     no_cache: bool = False
+    page: int = 1
 
     class Config:
         populate_by_name = True
@@ -247,7 +248,8 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
         success, result = downloader.download_bilibili_audio(
             request.bvid,
             request.cookie,
-            save_dir=str(get_temp_dir())
+            save_dir=str(get_temp_dir()),
+            page=request.page
         )
         download_time = time.time() - download_start
 
@@ -268,9 +270,10 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
         logger.info(f"音频下载完成: {temp_filename}")
 
         # 2. 使用转录服务处理
-        # 使用更友好的文件名用于日志显示
-        display_name = f"Bilibili_{request.bvid}"
-        result = await transcription_service.process_transcription(temp_filename, display_name, audio_url, request.bvid, audio_id, request.no_cache)
+        # 使用更友好的文件名用于日志显示，page 信息编码到 bvid 中确保缓存键唯一
+        display_name = f"Bilibili_{request.bvid}_p{request.page}" if request.page > 1 else f"Bilibili_{request.bvid}"
+        cache_bvid = f"{request.bvid}_p{request.page}" if request.page > 1 else request.bvid
+        result = await transcription_service.process_transcription(temp_filename, display_name, audio_url, cache_bvid, audio_id, request.no_cache)
 
         # 注入下载耗时到 timing
         if "timing" in result:

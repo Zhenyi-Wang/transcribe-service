@@ -20,16 +20,20 @@ class BilibiliVideoDownloader:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
 
-    def get_audio_url(self, bvid: str, cookie: str, extract_audio_info_only: bool = False) -> Optional[Tuple[str, dict]]:
+    def get_audio_url(self, bvid: str, cookie: str, extract_audio_info_only: bool = False, page: int = 1) -> Optional[Tuple[str, dict]]:
         """从页面源码获取B站音频URL（支持新旧两种格式）
 
         Args:
             bvid: B站视频ID
             cookie: B站Cookie
             extract_audio_info_only: 是否只提取音频信息（不获取URL）
+            page: 分P页码（默认 1）
         """
         try:
-            video_url = f"https://www.bilibili.com/video/{bvid}/"
+            if page > 1:
+                video_url = f"https://www.bilibili.com/video/{bvid}/?p={page}"
+            else:
+                video_url = f"https://www.bilibili.com/video/{bvid}/"
 
             headers = self.headers_template.copy()
             headers["Cookie"] = cookie
@@ -139,28 +143,29 @@ class BilibiliVideoDownloader:
             logger.error(f"下载失败: {e}")
             return False, str(e)
 
-    def get_audio_info(self, bvid: str, cookie: str) -> Optional[dict]:
+    def get_audio_info(self, bvid: str, cookie: str, page: int = 1) -> Optional[dict]:
         """仅获取音频信息，不下载"""
-        result = self.get_audio_url(bvid, cookie, extract_audio_info_only=True)
+        result = self.get_audio_url(bvid, cookie, extract_audio_info_only=True, page=page)
         if result:
             _, audio_info = result
             return audio_info
         return None
 
-    def download(self, id: str, cookie: str, save_dir: str = "tmp") -> Tuple[bool, Union[str, dict]]:
+    def download(self, id: str, cookie: str, save_dir: str = "tmp", page: int = 1) -> Tuple[bool, Union[str, dict]]:
         """下载B站视频音频的完整流程
 
         Args:
             id: B站视频BVID
             cookie: B站Cookie
             save_dir: 保存目录
+            page: 分P页码（默认 1）
 
         Returns:
             (success, result) - 成功时返回文件信息字典，失败时返回错误信息字符串
         """
         try:
             # 1. 首先获取音频信息（不包含URL）用于缓存检查
-            audio_info = self.get_audio_info(id, cookie)
+            audio_info = self.get_audio_info(id, cookie, page=page)
             if not audio_info:
                 return False, "无法获取音频信息"
 
@@ -170,20 +175,20 @@ class BilibiliVideoDownloader:
             else:
                 ext = '.m4s'
 
-            # 2. 先检查缓存（使用BVID+音频ID作为缓存键）
-            cached_file = cache_manager.get_cached_file(None, id, ext, str(audio_info['id']))
+            # 2. 先检查缓存（使用BVID+page+音频ID作为缓存键）
+            cached_file = cache_manager.get_cached_file(None, id, ext, str(audio_info['id']), page)
             if cached_file:
                 logger.info(f"使用缓存文件: {cached_file}")
                 # 返回缓存文件信息和音频ID
                 return True, {
                     "file_path": cached_file,
-                    "audio_url": f"cached://{id}_{audio_info['id']}",
+                    "audio_url": f"cached://{id}_p{page}_{audio_info['id']}",
                     "audio_id": str(audio_info['id'])
                 }
 
             # 3. 如果没有缓存，获取完整的音频URL进行下载
-            logger.info(f"获取音频URL: bvid={id}")
-            result = self.get_audio_url(id, cookie)
+            logger.info(f"获取音频URL: bvid={id}, page={page}")
+            result = self.get_audio_url(id, cookie, page=page)
 
             if not result:
                 return False, "无法获取音频URL"
@@ -197,16 +202,16 @@ class BilibiliVideoDownloader:
 
             # 4. 准备保存路径
             Path(save_dir).mkdir(exist_ok=True)
-            # 使用BVID和音频ID作为文件名
-            filename = f"{id}_audio_{audio_info['id']}{ext}"
+            # 使用BVID+page+音频ID作为文件名
+            filename = f"{id}_p{page}_audio_{audio_info['id']}{ext}"
             filepath = os.path.join(save_dir, filename)
 
             # 5. 下载文件
             success, result = self.download_audio(audio_url, cookie, filepath)
 
             if success:
-                # 6. 保存到缓存（使用BVID+音频ID作为缓存键）
-                cached_path = cache_manager.save_to_cache(audio_url, result, id, str(audio_info['id']))
+                # 6. 保存到缓存（使用BVID+page+音频ID作为缓存键）
+                cached_path = cache_manager.save_to_cache(audio_url, result, id, str(audio_info['id']), page)
                 # 返回包含音频URL和音频ID的字典
                 return True, {
                     "file_path": cached_path,

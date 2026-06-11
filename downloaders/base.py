@@ -39,13 +39,14 @@ class Downloader:
 
         return 'unknown', id
 
-    def download(self, id: str, cookie: str, save_dir: str = "tmp") -> Tuple[bool, Union[str, dict]]:
+    def download(self, id: str, cookie: str, save_dir: str = "tmp", page: int = 1) -> Tuple[bool, Union[str, dict]]:
         """根据ID类型下载音频
 
         Args:
             id: 视频/番剧ID (支持 BV... 或 ep2289525 格式)
             cookie: B站Cookie
             save_dir: 保存目录
+            page: 分P页码（仅 bvid 格式生效，默认 1）
 
         Returns:
             (success, result) - 成功时返回文件信息字典，失败时返回错误信息字符串
@@ -59,7 +60,7 @@ class Downloader:
         logger.info(f"检测到ID类型: {id_type}, 原始ID: {id}")
 
         if id_type == 'bvid':
-            return self.video_downloader.download(pure_id, cookie, save_dir)
+            return self.video_downloader.download(pure_id, cookie, save_dir, page=page)
         elif id_type == 'ep':
             return self.episode_downloader.download(pure_id, cookie, save_dir)
         else:
@@ -74,9 +75,9 @@ class BilibiliDownloader(Downloader):
     Deprecated: 建议直接使用 Downloader 类
     """
 
-    def download_bilibili_audio(self, bvid: str, cookie: str, save_dir: str = "tmp") -> Tuple[bool, Union[str, dict]]:
+    def download_bilibili_audio(self, bvid: str, cookie: str, save_dir: str = "tmp", page: int = 1) -> Tuple[bool, Union[str, dict]]:
         """下载B站音频的完整流程（向后兼容方法）
 
         Deprecated: 建议使用 download() 方法
         """
-        return self.download(bvid, cookie, save_dir)
+        return self.download(bvid, cookie, save_dir, page=page)

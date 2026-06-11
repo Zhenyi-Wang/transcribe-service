@@ -26,14 +26,14 @@ class CacheManager:
         else:
             logger.info("缓存已禁用")
 
-    def _get_cache_key(self, url: str = None, bvid: str = None, audio_id: str = None, file_path: str = None) -> str:
+    def _get_cache_key(self, url: str = None, bvid: str = None, audio_id: str = None, file_path: str = None, page: int = 1) -> str:
         """生成缓存键"""
         # 优先使用文件路径作为缓存键
         if file_path:
             content = file_path
-        # 优先使用BVID+音频ID作为缓存键，更稳定
+        # 优先使用BVID+page+音频ID作为缓存键，更稳定
         elif bvid and audio_id:
-            content = f"{bvid}_{audio_id}"
+            content = f"{bvid}_p{page}_{audio_id}"
         elif url and bvid:
             # 兼容旧版本，使用URL+BVID
             content = url + bvid
@@ -49,14 +49,14 @@ class CacheManager:
         """获取缓存文件路径"""
         return self.cache_dir / f"{cache_key}{ext}"
 
-    def get_cached_file(self, url: str, bvid: str = None, ext: str = '.mp3', audio_id: str = None) -> Optional[str]:
+    def get_cached_file(self, url: str, bvid: str = None, ext: str = '.mp3', audio_id: str = None, page: int = 1) -> Optional[str]:
         """获取缓存文件"""
         if not self.cache_enabled:
             return None
 
-        # 优先使用BVID+音频ID作为缓存键
+        # 优先使用BVID+page+音频ID作为缓存键
         if bvid and audio_id:
-            cache_key = self._get_cache_key(bvid=bvid, audio_id=audio_id)
+            cache_key = self._get_cache_key(bvid=bvid, audio_id=audio_id, page=page)
         else:
             cache_key = self._get_cache_key(url=url, bvid=bvid)
         cache_path = self._get_cache_path(cache_key, ext)
@@ -74,7 +74,7 @@ class CacheManager:
 
         return None
 
-    def save_to_cache(self, url: str, file_path: str, bvid: str = None, audio_id: str = None) -> str:
+    def save_to_cache(self, url: str, file_path: str, bvid: str = None, audio_id: str = None, page: int = 1) -> str:
         """保存文件到缓存"""
         if not self.cache_enabled:
             return file_path
@@ -84,9 +84,9 @@ class CacheManager:
         if not ext:
             ext = '.mp3'  # 默认扩展名
 
-        # 优先使用BVID+音频ID作为缓存键
+        # 优先使用BVID+page+音频ID作为缓存键
         if bvid and audio_id:
-            cache_key = self._get_cache_key(bvid=bvid, audio_id=audio_id)
+            cache_key = self._get_cache_key(bvid=bvid, audio_id=audio_id, page=page)
         else:
             cache_key = self._get_cache_key(url=url, bvid=bvid)
         cache_path = self._get_cache_path(cache_key, ext)
