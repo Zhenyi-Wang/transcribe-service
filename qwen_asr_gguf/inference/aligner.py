@@ -263,6 +263,10 @@ class QwenForcedAligner:
         if config.n_ctx < required_ctx:
             config.n_ctx = required_ctx
         self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=n_batch, n_ubatch=n_ubatch, embeddings=False, attention_type=0)
+        # 诊断用：记录 context 容量，供 align 越界检查（GGML get_rows 索引越界定位）
+        self.n_batch = n_batch
+        self.n_ubatch = n_ubatch
+        self.n_ctx = config.n_ctx
         
         self.processor = AlignerProcessor()
         self.ID_AUDIO_START = self.model.token_to_id("<|audio_start|>")
@@ -330,6 +334,16 @@ class QwenForcedAligner:
         batch.set_embd(full_embd, pos=pos_arr)
         for idx in ts_positions: batch.logits[idx] = 1 # 只计算 timestamp 处的 logits 以提速
 
+        # 诊断日志：decode 前记录参数。pos_arr = n_total × 4（mrope 四平面），超 n_batch 即 get_rows 越界。
+        # abort 会吞 print 缓冲，故用 logger（每次 emit 立即 flush，写 logs/latest.log）。
+        _pos_arr_len = n_total * 4
+        _overflow = _pos_arr_len > self.n_batch
+        logger.warning(
+            f"[DIAG-ALIGN] words={len(words)} audio_embd={audio_embd.shape[0]} "
+            f"post_ids={len(post_ids)} n_total={n_total} pos_arr_len={_pos_arr_len} "
+            f"n_batch={self.n_batch} n_ubatch={self.n_ubatch} n_ctx={self.n_ctx} "
+            f"WILL_OVERFLOW={'YES' if _overflow else 'no'}"
+        )
         self.ctx.clear_kv_cache()
         self.ctx.decode(batch)
         t_dec = time.time() - t_dec_start

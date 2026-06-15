@@ -15,6 +15,7 @@ from .schema import MsgType, StreamingMessage, DecodeResult, ASREngineConfig, Tr
 from .utils import normalize_language_name, validate_language
 from .encoder import QwenAudioEncoder
 from . import llama
+from . import logger
 
 @dataclasses.dataclass
 class ASRS_Segment:
@@ -71,6 +72,10 @@ class QwenASREngine:
         if config.n_ctx < required_ctx:
             config.n_ctx = required_ctx
         self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=n_batch, n_ubatch=n_ubatch, embeddings=False, attention_type=0)
+        # 诊断用：记录 context 容量，供 _decode 越界检查（GGML get_rows 索引越界定位）
+        self.n_batch = n_batch
+        self.n_ubatch = n_ubatch
+        self.n_ctx = config.n_ctx
 
         # 缓存 Token ID
         self.ID_IM_START = self.model.token_to_id("<|im_start|>")
@@ -176,6 +181,16 @@ class QwenASREngine:
         batch.set_embd(full_embd, pos=pos_arr)
 
         # 1. Prefill
+        # 诊断日志：prefill 前记录参数。GGML_ASSERT 越界走 C 层 abort()，会吞掉 print 缓冲，
+        # 故用 logger（Unbuffered/StreamHandler 每次 emit 立即 flush，abort 吞不掉）。
+        # pos_arr = total_len × 4（mrope 四平面），pos_arr_len > n_batch 即触发 get_rows 越界。
+        _pos_arr_len = total_len * 4
+        _overflow = _pos_arr_len > self.n_batch or total_len > self.n_ubatch
+        logger.warning(
+            f"[DIAG-ASR-PREFILL] total_len={total_len} pos_arr_len={_pos_arr_len} "
+            f"n_batch={self.n_batch} n_ubatch={self.n_ubatch} n_ctx={self.n_ctx} "
+            f"WILL_OVERFLOW={'YES' if _overflow else 'no'}"
+        )
         self.ctx.clear_kv_cache()
         t_pre_start = time.time()
         self.ctx.decode(batch)
@@ -189,6 +204,13 @@ class QwenASREngine:
         stable_text_acc = ""
         text_decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
         
+        # 诊断日志：生成阶段位置从 total_len 起逐 token 增长，最远到 total_len + 512，
+        # 接近 n_ctx 才报警（正常 chunk 不刷屏）。
+        if total_len + 512 > self.n_ctx:
+            logger.error(
+                f"[DIAG-ASR-GEN] start_pos={total_len} max_gen=512 farthest_pos={total_len + 512} "
+                f"n_ctx={self.n_ctx} WILL_OVERFLOW_CTX=YES"
+            )
         # 每次解码使用新的随机种子
         seed = int(np.random.randint(0, 2**31 - 1))
         sampler = llama.LlamaSampler(temperature=temperature, seed=seed)

@@ -73,6 +73,10 @@ class GGUFBackend(ASRBackend):
 
         if not self._transcribe_lock.acquire(blocking=True, timeout=3600):
             raise RuntimeError("转录排队超时（前一个任务占用超过 3600 秒）")
+        # 诊断日志：记录进入互斥区。用 stderr（redirect_stdout 只吞 stdout，不吞 stderr），
+        # 与 GGML_ABORT backtrace 同流，方便看并发/请求边界与崩溃的时序关系。
+        print(f"[DIAG-GGUF-ENTER] file={audio_file} pid={os.getpid()} lock_acquired=ok",
+              file=sys.stderr, flush=True)
         try:
             t_start = time.time()
             with contextlib.redirect_stdout(io.StringIO()):
