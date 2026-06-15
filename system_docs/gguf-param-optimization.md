@@ -131,3 +131,36 @@ GGUF 后端依赖 llama.cpp 的 C 动态库，位于 `lib/` 目录（约 510M）
 
 **上游仓库**: https://github.com/ggml-org/llama.cpp
 **本项目 fork**: https://github.com/Zhenyi-Wang/llama.cpp（用于提交 PR）
+
+## 附录：llama.cpp causal attention 参数覆盖机制
+
+通过 ctypes 查询 `llama_n_ctx` / `llama_n_batch` / `llama_n_ubatch`（返回 `cparams` 内部值）实测验证。
+
+### 覆盖链（llama-context.cpp:161-163）
+
+```cpp
+// causal 模式下 n_batch 被 min(n_ctx, n_batch) 限制
+cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
+
+// n_ubatch 也被 min(n_batch, n_ubatch) 连锁限制
+cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+```
+
+连锁效应：`n_ctx` 不足 → `n_batch` 被砍 → `n_ubatch` 也被连带砍。
+
+### 实测数据
+
+| 模式 | 请求 n_ctx | 请求 n_batch | 实际 n_batch | 请求 n_ubatch | 实际 n_ubatch |
+|------|-----------|-------------|-------------|---------------|---------------|
+| NON-CAUSAL (attn=1) | 2048 | 16384 | **16384** | 4096 | **4096** |
+| CAUSAL (attn=0) | 2048 | 16384 | **2048** | 4096 | **2048** |
+| CAUSAL (attn=0) | 4096 | 16384 | **4096** | 4096 | 4096 |
+| CAUSAL (attn=0) | 36864 | 16384 | **16384** | 4096 | 4096 |
+| UNSPECIFIED (attn=-1) | 2048 | 16384 | **2048** | 4096 | **2048** |
+
+### 结论
+
+- non-causal 模式下参数原样传递，不会被覆盖
+- causal 模式下 `n_batch` 和 `n_ubatch` 都会被 `n_ctx` 限制
+- `attention_type=-1`（UNSPECIFIED）从模型元数据读取，qwen3vl 架构默认 `causal_attn=true`，效果等同于 attn=0
+- 确保 `n_ctx > n_batch` 即可避免覆盖（当前代码通过 `n_ctx = n_batch + 4096` 实现）
