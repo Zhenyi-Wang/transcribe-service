@@ -64,6 +64,13 @@ def _register_backends():
         import logging
         logging.getLogger(__name__).warning(f"FunASR 后端不可用: {e}")
 
+    try:
+        from .asr_engine_backend import ASREngineClientBackend
+        BackendFactory.register("asr-engine", ASREngineClientBackend)
+    except ImportError as e:
+        import logging
+        logging.getLogger(__name__).warning(f"ASR-Engine 后端不可用: {e}")
+
 
 # 模块导入时自动注册
 _register_backends()

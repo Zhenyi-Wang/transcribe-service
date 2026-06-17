@@ -39,7 +39,7 @@ class Config:
     # ========== 后端配置 ==========
     @property
     def backend_name(self) -> str:
-        """后端名称（funasr / qwen3-asr / gguf）"""
+        """后端名称（funasr / qwen3-asr / gguf / asr-engine）"""
         return self.get('backend.name', 'qwen3-asr')
 
     # GGUF 后端配置
@@ -94,6 +94,17 @@ class Config:
     def funasr_punc_model(self) -> str:
         """FunASR 标点模型"""
         return self.get('backend.funasr.punc_model', 'ct-punc')
+
+    # ASR-Engine 后端配置（独立 asr-engine 服务，HTTP 转发）
+    @property
+    def asr_engine_url(self) -> str:
+        """ASR-Engine 服务地址"""
+        return self.get('asr_engine.url', 'http://127.0.0.1:31090')
+
+    @property
+    def asr_engine_token(self) -> str:
+        """ASR-Engine 访问令牌（留空=不鉴权）"""
+        return self.get('asr_engine.token', '')
 
     # ========== 服务器配置 ==========
     @property
