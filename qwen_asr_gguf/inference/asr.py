@@ -83,8 +83,22 @@ class QwenASREngine:
         self.ID_AUDIO_START = self.model.token_to_id("<|audio_start|>")
         self.ID_AUDIO_END = self.model.token_to_id("<|audio_end|>")
         self.ID_ASR_TEXT = self.model.token_to_id("<asr_text>")
+        self._cancel_event = None  # 可选外部取消信号（threading.Event），asr() 在 chunk 边界检查；None=不可取消（默认，向后兼容）
+
+    def set_cancel_event(self, event):
+        """设置/清除外部取消信号。asr() 在每个 chunk 边界检查 event.is_set()。
+        event=None 清除（恢复默认不可取消）。transcribe-service 等不调此方法的调用方行为不变。"""
+        self._cancel_event = event
 
     def shutdown(self):
+        # 主动断引用，触发各 __del__ → llama_free / llama_model_free（确定性释放，不等 GC）。
+        # llama.py 已有：LlamaModel.__del__→llama_model_free、LlamaContext.__del__→llama_free。
+        # aligner/encoder 持有自己的 model/ctx/ONNX session，断引用后由其 __del__/GC 级联释放。
+        self.ctx = None
+        self.model = None
+        self.aligner = None
+        self.encoder = None
+        self.embedding_table = None
         if self.verbose: print("--- [QwenASR] 引擎已关闭 ---")
 
     def _build_prompt_embd(self, audio_embd: np.ndarray, prefix_text: str, context: Optional[str], language: Optional[str]):
@@ -378,7 +392,13 @@ class QwenASREngine:
         detected_language = language
 
         # --- 顺序同步处理循环 ---
+        cancelled = False
         for i in range(num_chunks):
+            # cancel 检查：每个 chunk 边界查外部信号（粗粒度，当前 chunk 不可中断）
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                cancelled = True
+                if self.verbose: print("\n[取消] 收到取消信号，提前结束（已完成 chunk 保留）")
+                break
             # 1. 编码第 i 片段
             s, e = i * samples_per_chunk, min((i + 1) * samples_per_chunk, total_len)
             chunk_data = audio[s:e]
@@ -441,5 +461,5 @@ class QwenASREngine:
             text=total_full_text,
             language=detected_language or "",
             alignment=ForcedAlignResult(items=all_aligned_items) if all_aligned_items else None,
-            performance=stats
+            performance={**stats, "cancelled": True} if cancelled else stats
         )
