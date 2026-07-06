@@ -182,7 +182,12 @@ class QwenAudioEncoder:
     def _run_frontend(self, mel: np.ndarray) -> np.ndarray:
         """前端推理流水线：Pad -> Chunk Loop -> Concat -> Slice"""
         T = mel.shape[1]
-        
+        if T == 0:
+            raise ValueError(
+                "音频太短，无法提取 Mel 特征（输入音频不足 10ms / 160 采样）。"
+                "这通常是因为最后一个分段的音频极短（< 0.01s），请检查分段逻辑。"
+            )
+
         # 1. 必须 Pad 到 100 的倍数
         pad_len = (100 - (T % 100)) % 100
         if pad_len > 0:

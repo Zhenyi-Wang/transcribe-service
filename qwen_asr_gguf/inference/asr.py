@@ -368,6 +368,15 @@ class QwenASREngine:
         num_chunks = int(np.ceil(total_len / samples_per_chunk))
         total_duration = total_len / sr
 
+        # 丢弃极短的尾部分段（< 0.5s），避免 Mel T=0 导致 _run_frontend 崩溃。
+        # 触发场景：ffmpeg 提取的音频长度恰好比 N × samples_per_chunk 多几个采样，
+        # ceil 产生一个几乎空白的尾段，其音频切片 < 160 采样时 Mel 提取器返回 0 帧。
+        MIN_TAIL_SEC = 0.5
+        if num_chunks > 1:
+            tail_samples = total_len - (num_chunks - 1) * samples_per_chunk
+            if tail_samples < int(MIN_TAIL_SEC * sr):
+                num_chunks -= 1
+
         # 记忆管理 (预定义所有分片的物理边界)
         all_segments: List[ASRS_Segment] = [
             ASRS_Segment(
