@@ -317,37 +317,53 @@ def _merge_char_timestamps(text: str, timestamps: list) -> list:
 
     # 将每个文本段映射到时间戳范围
     # 从 text 中去掉标点，逐段推进 ts_chars 的偏移
+    #
+    # 文本段一个都不能丢：时间戳与文本失配（音乐复读导致 aligner 截断、
+    # 英文词空格导致 find 错位）时降级为估算时间兜底，而不是静默 continue。
+    # 曾因 continue 丢弃尾部 60%+ 文本（讲章批量转录事故，2026-07）。
     body = []
     ts_offset = 0
+    last_end_time = 0.0  # 上一段（含兜底段）的结束时间，兜底段从此推进
 
     for seg_text in segments:
         # 去掉标点后的纯文本长度，用于在 ts_chars 中定位
         clean_seg = re.sub(r'[^\w]', '', seg_text, flags=re.UNICODE)
         seg_len = len(clean_seg)
 
-        if seg_len == 0 or ts_offset >= len(ts_chars):
+        if seg_len == 0:
             continue
 
         # 在 ts_chars 中找到匹配位置
-        match_pos = ts_chars.find(clean_seg, ts_offset)
-        if match_pos < 0:
-            # 逐字推进兜底
-            match_pos = ts_offset
+        match_pos = -1
+        if ts_offset < len(ts_chars):
+            match_pos = ts_chars.find(clean_seg, ts_offset)
+            if match_pos < 0:
+                # 逐字推进兜底
+                match_pos = ts_offset
 
-        start_idx = match_pos
-        end_idx = min(match_pos + seg_len - 1, len(timestamps) - 1)
+        if 0 <= match_pos < len(timestamps):
+            # 有真实时间戳：取首尾字时间
+            start_idx = match_pos
+            end_idx = min(match_pos + seg_len - 1, len(timestamps) - 1)
+            seg_from = timestamps[start_idx].get("start", 0)
+            seg_to = timestamps[end_idx].get("end", 0)
+            if seg_to <= seg_from:
+                seg_to = seg_from + 0.5
+            ts_offset = end_idx + 1
+        else:
+            # 时间戳耗尽/失配：用上一段结束时间 + 按语速估算的时长兜底
+            seg_from = last_end_time
+            seg_to = last_end_time + max(seg_len * 0.3, 1.0)
 
-        if start_idx < len(timestamps) and end_idx < len(timestamps):
-            body.append({
-                "from": round(timestamps[start_idx].get("start", 0), 2),
-                "to": round(timestamps[end_idx].get("end", 0), 2),
-                "sid": len(body) + 1,
-                "location": 2,
-                "content": seg_text,
-                "music": 0
-            })
-
-        ts_offset = end_idx + 1
+        body.append({
+            "from": round(seg_from, 2),
+            "to": round(seg_to, 2),
+            "sid": len(body) + 1,
+            "location": 2,
+            "content": seg_text,
+            "music": 0
+        })
+        last_end_time = max(last_end_time, seg_to)
 
     return body if body else generate_subtitle_segments(text)
 
