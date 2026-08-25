@@ -261,13 +261,21 @@ def generate_subtitle_segments_from_timestamps(text: str, timestamps: list, lang
     if not timestamps:
         return generate_subtitle_segments(text)
 
+    # CJK 语言不使用空格分词，其他语言（英法德西等）使用空格
+    _CJK_LANGS = {"zh", "ja", "ko", "yue", ""}
+
     # 判断是否为字级时间戳：前 10 段平均文本长度 <= 2 视为字级
     avg_len = sum(len(ts.get("text", "")) for ts in timestamps[:10]) / min(len(timestamps), 10)
     if avg_len <= 2:
-        return _merge_char_timestamps(text, timestamps)
+        if lang in _CJK_LANGS:
+            return _merge_char_timestamps(text, timestamps)
+        # 非 CJK 语言的碎片级时间戳（Qwen3-ForcedAligner 对天城文按基字符+
+        # 组合符号对齐，2026-08 印地语事故）：碎片保留空格，先按空格重组为
+        # 词级，再走空格语言分段（其强制拆分兜底可防单条超长字幕）
+        regrouped = _regroup_fragments_by_space(timestamps)
+        if regrouped:
+            timestamps = regrouped
 
-    # CJK 语言不使用空格分词，其他语言（英法德西等）使用空格
-    _CJK_LANGS = {"zh", "ja", "ko", "yue", ""}
     use_spaces = lang not in _CJK_LANGS
 
     if use_spaces:
@@ -275,6 +283,47 @@ def generate_subtitle_segments_from_timestamps(text: str, timestamps: list, lang
     else:
         # 非空格语言（日/韩）：简单按 min_len 合并，不关注空格
         return _segment_simple(timestamps, text)
+
+
+def _regroup_fragments_by_space(timestamps: list) -> list:
+    """把碎片级时间戳按空格重组为词级时间戳。
+
+    Qwen3-ForcedAligner 对天城文（印地语）等文字按基字符/组合符号碎片对齐，
+    碎片保留空格信息（如 "ैं " 或独立 " "）。以尾随空格为词边界拼接碎片，
+    每词取首碎片 start、末碎片 end，供 _segment_by_punctuation 分段。
+
+    Returns:
+        词级时间戳列表 [{"text", "start", "end"}, ...]，text 保留单个尾随空格
+        （_segment_by_punctuation 依赖尾随空格判断词间距）；无可重组内容时为空列表
+    """
+    words = []
+    current = []  # [(frag_text, start, end)]
+
+    def _flush_word():
+        if not current:
+            return
+        word_text = "".join(w[0] for w in current).rstrip()
+        if word_text:
+            words.append({
+                "text": word_text + " ",
+                "start": current[0][1],
+                "end": current[-1][2],
+            })
+        current.clear()
+
+    for ts in timestamps:
+        frag = ts.get("text", "")
+        if not frag:
+            continue
+        current.append((frag, ts.get("start", 0), ts.get("end", 0)))
+        if frag.endswith(" "):
+            _flush_word()
+    _flush_word()  # 尾部无空格的残余词
+
+    # 最后一个词的尾随空格无后续词，去掉以免拼接出尾空白
+    if words:
+        words[-1]["text"] = words[-1]["text"].rstrip()
+    return words
 
 
 def _merge_char_timestamps(text: str, timestamps: list) -> list:
@@ -303,8 +352,15 @@ def _merge_char_timestamps(text: str, timestamps: list) -> list:
         else:
             for part in re.split(r'(?<=[，、；：])', sent):
                 part = part.strip()
-                if part:
+                if not part:
+                    continue
+                if len(part) <= max_len * 3:
                     segments.append(part)
+                else:
+                    # 无次级标点的超长句强制按长度拆分：分句标点不匹配的语言
+                    # 曾整段输出单条字幕（2026-08 印地语事故），此处为兜底
+                    limit = max_len * 3
+                    segments.extend(part[i:i + limit] for i in range(0, len(part), limit))
 
     # 合并过短的段落（少于 min_len 字）到前一段
     merged = []
@@ -425,7 +481,7 @@ def _segment_by_punctuation(timestamps: list, text: str) -> list:
         current_words.clear()
 
     def _is_punct_only(s: str) -> bool:
-        return all(c in '.!?,;:\'"()-' for c in s)
+        return all(c in '.!?,;:\'"()-।॥' for c in s)
 
     for ts in timestamps:
         raw_text = ts.get("text", "")
@@ -439,8 +495,8 @@ def _segment_by_punctuation(timestamps: list, text: str) -> list:
         if _is_punct_only(seg_text):
             if current_words:
                 current_words.append((seg_text, ts.get("start", 0), ts.get("end", 0)))
-                # 句末标点触发 flush，确保 "ID." 之类不被拆散
-                if seg_text in '.!?':
+                # 句末标点触发 flush，确保 "ID." 之类不被拆散（।॥ 为印地语句读）
+                if seg_text in '.!?।॥':
                     _flush()
             # 如果 current_words 为空，这是段首标点（如 " ."），丢弃
             pending_space = raw_text.rstrip() != raw_text
@@ -455,7 +511,7 @@ def _segment_by_punctuation(timestamps: list, text: str) -> list:
         total_len = sum(len(w[0]) for w in current_words)
 
         stripped = seg_text
-        ends_sentence = stripped.endswith(('.', '!', '?'))
+        ends_sentence = stripped.endswith(('.', '!', '?', '।', '॥'))
         ends_clause = stripped.endswith((',', ';', ':'))
 
         if ends_sentence:
