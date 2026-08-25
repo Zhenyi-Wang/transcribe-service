@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .schema import ForcedAlignItem, ForcedAlignResult, AlignerConfig
 from .encoder import QwenAudioEncoder
-from .utils import normalize_language_name, validate_language
+from .utils import normalize_language_name, validate_language, clamp_to_audio_end
 from . import llama
 from . import logger
 
@@ -360,12 +360,15 @@ class QwenForcedAligner:
         ms = np.array(fixed_ts) * self.STEP_MS
         items = [
             ForcedAlignItem(
-                text=w, 
-                start_time=ms[i*2]/1000.0 + offset_sec, 
+                text=w,
+                start_time=ms[i*2]/1000.0 + offset_sec,
                 end_time=ms[i*2+1]/1000.0 + offset_sec
-            ) 
+            )
             for i, w in enumerate(words)
         ]
+        # 上限 clamp 到本块真实音频末尾（audio 为 16kHz 采样，见 asr.py sr=16000），
+        # 在 reconcile 之前做，标点/空格补全传播的时间戳继承 clamp 后的值
+        items = clamp_to_audio_end(items, len(audio) / 16000.0 + offset_sec)
         
         # 5. [后处理] 将缺失的标点符号和空格找回来，并补全时间戳
         final_items = self.processor.reconcile(text, items)
