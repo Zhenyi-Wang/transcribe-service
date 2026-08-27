@@ -11,10 +11,12 @@ Qwen3-ASR 音频转录服务，提供 REST API 将音频文件和B站视频转�
 ```bash
 conda activate funasr
 
-# 启动服务（自动重载）
-bash run.sh
+# 服务化启动：幂等地在 tmux 'transcribe' 会话中运行 run.sh
+# （WSL 启动时由 systemd 用户单元 ~/.config/systemd/user/transcribe.service 自动执行）
+bash start.sh
 
-# 启动服务（无自动重载）
+# 前台直接跑（调试用；默认自动重载，加 --no-reload 关闭）
+bash run.sh
 bash run.sh --no-reload
 
 # 测试 API
