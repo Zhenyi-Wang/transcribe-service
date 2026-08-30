@@ -17,6 +17,10 @@ MAX_DOWNLOAD_ATTEMPTS = 3
 DOWNLOAD_TIMEOUT = (10, 300)  # (连接超时, 读取超时)
 
 
+class TrialSegmentError(Exception):
+    """B站未登录仅返回试看片段（durl 总时长远小于视频时长），cookie 失效所致"""
+    pass
+
 
 class BilibiliVideoDownloader:
     """B站视频（bvid格式）音频下载器"""
@@ -35,6 +39,9 @@ class BilibiliVideoDownloader:
             cookie: B站Cookie
             extract_audio_info_only: 是否只提取音频信息（不获取URL）
             page: 分P页码（默认 1）
+
+        Raises:
+            TrialSegmentError: 未登录仅返回试看片段（durl 总时长 << 视频时长）
         """
         try:
             if page > 1:
@@ -90,6 +97,17 @@ class BilibiliVideoDownloader:
                 logger.info("使用旧版格式（durl）获取音视频")
                 durl = playinfo_data['data']['durl']
                 if isinstance(durl, list) and len(durl) > 0 and 'url' in durl[0]:
+                    # 多段 durl 需要分段下载合并，明确报不支持而非静默只取第一段
+                    if len(durl) > 1:
+                        raise TrialSegmentError(
+                            f"多段 durl（{len(durl)} 段）暂不支持，请反馈")
+                    # 未登录时 B站仅返回试看片段：durl 时长远小于视频时长
+                    timelength = playinfo_data['data'].get('timelength')
+                    durl_total_ms = sum(x.get('length', 0) for x in durl if isinstance(x, dict))
+                    if timelength and durl_total_ms > 0 and durl_total_ms < timelength - 3000:
+                        raise TrialSegmentError(
+                            f"B站仅返回试看片段（durl 总时长 {durl_total_ms/1000:.0f}s，"
+                            f"视频时长 {timelength/1000:.0f}s），疑似 B站 cookie 失效，请更新 cookie")
                     audio_info = {
                         'url': durl[0]['url'],
                         'id': 'video_audio',
@@ -109,6 +127,8 @@ class BilibiliVideoDownloader:
                 logger.error("无法从 playinfo 数据中提取音频信息，既没有 dash 也没有 durl")
                 return None
 
+        except TrialSegmentError:
+            raise
         except Exception as e:
             logger.error(f"获取音频URL失败: {e}")
             return None
@@ -229,7 +249,11 @@ class BilibiliVideoDownloader:
             # 下载写到唯一临时名（并发同ID请求不互相踩踏），校验通过后原子落位
             last_error = None
             for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
-                result = self.get_audio_url(id, cookie, page=page)
+                try:
+                    result = self.get_audio_url(id, cookie, page=page)
+                except TrialSegmentError as e:
+                    # cookie 失效重试无意义，立即失败
+                    return False, str(e)
                 if not result:
                     last_error = "无法获取音频URL"
                     logger.warning(f"第 {attempt}/{MAX_DOWNLOAD_ATTEMPTS} 次{last_error}")
@@ -272,6 +296,8 @@ class BilibiliVideoDownloader:
 
             return False, f"{last_error}（已尝试 {MAX_DOWNLOAD_ATTEMPTS} 次）"
 
+        except TrialSegmentError as e:
+            return False, str(e)
         except Exception as e:
             logger.error(f"下载流程失败: {e}")
             return False, str(e)

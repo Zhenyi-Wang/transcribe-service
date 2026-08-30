@@ -278,7 +278,12 @@ class BilibiliEpisodeDownloader:
                 except OSError as e:
                     logger.warning(f"删除不完整文件失败: {e}")
 
-            return False, f"{last_error}（已尝试 {MAX_DOWNLOAD_ATTEMPTS} 次）"
+            final_msg = f"{last_error}（已尝试 {MAX_DOWNLOAD_ATTEMPTS} 次）"
+            if last_error and "音频不完整" in last_error:
+                # 仅 ffprobe 时长不足场景提示（网络中断的"下载不完整"不归因 cookie）
+                # 番剧未登录预览走 dash（无 durl 可直接比对），重试耗尽后补充提示
+                final_msg += "；番剧未登录仅提供预览片段，疑似 B站 cookie 失效，请更新 cookie"
+            return False, final_msg
 
         except Exception as e:
             logger.error(f"下载流程失败: {e}")

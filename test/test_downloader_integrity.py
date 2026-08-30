@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from downloaders.bilibili_video import BilibiliVideoDownloader
 from downloaders.bilibili_episode import BilibiliEpisodeDownloader
+from downloaders.bilibili_video import TrialSegmentError
 
 MAX_ATTEMPTS = 3  # 首次 + 2 次重试
 
@@ -265,6 +266,15 @@ class TestVideoDownloadFlow:
         assert url_mock.call_count == MAX_ATTEMPTS
         assert not dl_mock.called
 
+    def test_trial_segment_error_from_get_audio_info_bubbles_with_hint(self, video_dl, tmp_path):
+        # step-1 get_audio_info 抛试看片段错误时，外层兜底应给出明确信息
+        def raise_trial(*args, **kwargs):
+            raise TrialSegmentError("B站仅返回试看片段")
+        with patch.object(video_dl, "get_audio_info", side_effect=raise_trial):
+            ok, result = video_dl.download("BV1xx", "ck", save_dir=str(tmp_path))
+        assert not ok
+        assert "试看" in result
+
     def test_good_cached_file_short_circuits(self, video_dl, tmp_path):
         good_cache = tmp_path / "cached.m4s"
         good_cache.write_bytes(b"fine")
@@ -322,6 +332,77 @@ class TestVideoTimelengthExtraction:
             info = video_dl.get_audio_info("BV1xx", "ck")
         assert info["timelength"] == 123456
 
+
+# ---------- durl 试看片段检测 ----------
+
+def durl_html(timelength_ms, durl_lengths_ms):
+    """构造 durl 格式 playinfo 页面，durl 段各自声明 length(ms)"""
+    segments = ",".join(
+        f'{{"order":{i+1},"length":{l},"url":"http://seg{i}.mp4","size":1000}}'
+        for i, l in enumerate(durl_lengths_ms)
+    )
+    return (f'<html><script>window.__playinfo__={{"data":{{"timelength":{timelength_ms},'
+            f'"durl":[{segments}]}}}}</script></html>')
+
+
+class TestTrialSegmentDetection:
+    def test_durl_shorter_than_timelength_raises(self, video_dl):
+        # 未登录：706.6s 视频只返回 30s 试看片段
+        resp = MagicMock()
+        resp.text = durl_html(706600, [29900])
+        resp.raise_for_status = lambda: None
+        with patch("downloaders.bilibili_video.requests.get", return_value=resp):
+            with pytest.raises(TrialSegmentError):
+                video_dl.get_audio_url("BV1xx", "ck")
+
+    def test_durl_without_length_field_does_not_raise(self, video_dl):
+        # durl 条目缺 length 字段时不应误判为试看片段
+        resp = MagicMock()
+        resp.text = ('<html><script>window.__playinfo__={"data":{"timelength":60000,'
+                     '"durl":[{"order":1,"url":"http://seg0.mp4","size":1000}]}}</script></html>')
+        resp.raise_for_status = lambda: None
+        with patch("downloaders.bilibili_video.requests.get", return_value=resp):
+            result = video_dl.get_audio_url("BV1xx", "ck")
+        assert result is not None
+
+    def test_multi_segment_durl_fails_fast(self, video_dl):
+        # 多段 durl 明确报不支持，而非静默只下载第一段
+        resp = MagicMock()
+        resp.text = durl_html(120000, [60000, 60000])
+        resp.raise_for_status = lambda: None
+        with patch("downloaders.bilibili_video.requests.get", return_value=resp):
+            with pytest.raises(TrialSegmentError, match="多段"):
+                video_dl.get_audio_url("BV1xx", "ck")
+
+    def test_durl_full_length_passes(self, video_dl):
+        # 老视频正常 durl 单段，时长与 timelength 一致
+        resp = MagicMock()
+        resp.text = durl_html(60000, [59900])
+        resp.raise_for_status = lambda: None
+        with patch("downloaders.bilibili_video.requests.get", return_value=resp):
+            result = video_dl.get_audio_url("BV1xx", "ck")
+        url, info = result
+        assert url == "http://seg0.mp4"
+        assert info["timelength"] == 60000
+
+    def test_trial_segment_fails_fast_without_retry(self, video_dl, tmp_path):
+        # 试看片段错误应立即失败，不触发重试（cookie 问题重试无意义）
+        p1 = patch.object(video_dl, "get_audio_info",
+                          return_value={"id": "video_audio", "bandwidth": 0,
+                                        "codecs": "h264+aac", "format": "durl",
+                                        "timelength": 706600})
+        def raise_trial(*args, **kwargs):
+            raise TrialSegmentError("B站仅返回试看片段")
+        with p1, \
+             patch.object(video_dl, "get_audio_url", side_effect=raise_trial) as url_mock, \
+             patch.object(video_dl, "download_audio") as dl_mock, \
+             patch("downloaders.bilibili_video.cache_manager") as cache_mock:
+            cache_mock.get_cached_file.return_value = None
+            ok, result = video_dl.download("BV1xx", "ck", save_dir=str(tmp_path))
+        assert not ok
+        assert "试看" in result
+        assert url_mock.call_count == 1  # 仅首次调用，无重试
+        assert not dl_mock.called
 
 
 # ---------- episode 下载器 ----------
@@ -383,6 +464,25 @@ class TestEpisodeDownloadFlow:
         assert not ok
         assert "不完整" in detail
         assert not target.exists()
+
+    def test_exhausted_retries_hint_cookie_for_truncated_audio(self, episode_dl, tmp_path):
+        # 番剧未登录预览走 dash 无 durl 可比对：重试耗尽时应提示 cookie 失效
+        target = str(tmp_path / "b.m4s")
+        p1, p2, p3 = self._patch_core(
+            episode_dl,
+            {"id": 30280, "bandwidth": 66560, "codecs": "mp4a.40.2",
+             "format": "dash", "timelength": 234567},
+            [(True, target)] * MAX_ATTEMPTS,
+        )
+        with p1, p2, p3, \
+             patch("downloaders.bilibili_episode.verify_audio_file",
+                   return_value=(False, "音频不完整: 实际时长 30.0s，期望 234.6s")), \
+             patch("downloaders.bilibili_episode.cache_manager") as cache_mock, \
+             patch("os.remove"):
+            cache_mock.get_cached_file.return_value = None
+            ok, result = episode_dl.download("2289525", "ck", save_dir=str(tmp_path))
+        assert not ok
+        assert "cookie" in result.lower()
 
     def test_network_incomplete_does_not_hint_cookie(self, episode_dl, tmp_path):
         # 纯网络中断（下载不完整）不该被误归因为 cookie 失效
