@@ -49,6 +49,7 @@ GGUF 后端在 `backends/gguf_backend.py` 之上还有 `qwen_asr_gguf/` 包（ON
 - `TranscriptionService` (transcribe.py) — 转录编排：缓存检查 → 转录 → 字幕格式化 → 缓存保存
 - `CacheManager` (cache_manager.py) — MD5 键 + TTL 过期，启动时清理
 - `BilibiliDownloader` (downloaders/) — 按 BV/ep 分发到 VideoDownloader 或 EpisodeDownloader
+- 完整性校验 (downloaders/integrity.py) — 下载层 content-length 比对 + ffprobe 末包时长校验（format duration 因 fMP4 sidx 头部索引不可信）；校验通过才入缓存，缓存命中复检，坏缓存自动删除重下；失败重试 3 次尝试；未登录试看片段/多段 durl 立即报错不重试（`TrialSegmentError`）
 
 ### 配置
 
