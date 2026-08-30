@@ -1,5 +1,6 @@
 import os
 import time
+import threading
 import requests
 import json
 import re
@@ -7,8 +8,13 @@ from pathlib import Path
 from typing import Optional, Tuple, Union
 from logger_config import setup_logger
 from cache_manager import cache_manager
+from .integrity import verify_audio_file
 
 logger = setup_logger('bilibili_episode')
+
+# 下载+校验最大尝试次数（首次 + 2 次重试）
+MAX_DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_TIMEOUT = (10, 300)  # (连接超时, 读取超时)
 
 
 class BilibiliEpisodeDownloader:
@@ -36,7 +42,7 @@ class BilibiliEpisodeDownloader:
 
             if not extract_audio_info_only:
                 logger.info(f"获取番剧页面: {episode_url}")
-            response = requests.get(episode_url, headers=headers)
+            response = requests.get(episode_url, headers=headers, timeout=(10, 30))
             response.raise_for_status()
             html_content = response.text
 
@@ -109,7 +115,8 @@ class BilibiliEpisodeDownloader:
                 'id': audio['id'],
                 'bandwidth': audio['bandwidth'],
                 'codecs': audio['codecs'],
-                'format': 'dash'
+                'format': 'dash',
+                'timelength': result.get('timelength')  # 视频时长(ms)，用于完整性校验
             }
 
             logger.info(f"找到音频信息 - ID: {audio_info['id']}, "
@@ -131,10 +138,14 @@ class BilibiliEpisodeDownloader:
             logger.info(f"开始下载: {filename}")
             logger.info(f"实际下载URL: {audio_url}")
 
-            response = requests.get(audio_url, headers=headers, stream=True)
+            response = requests.get(audio_url, headers=headers, stream=True, timeout=DOWNLOAD_TIMEOUT)
             response.raise_for_status()
 
-            total_size = int(response.headers.get('content-length', 0))
+            # 重复头会被 requests 合并为 "n, n"，取首段
+            try:
+                total_size = int(str(response.headers.get('content-length', 0)).split(",")[0].strip())
+            except ValueError:
+                total_size = 0
             downloaded_size = 0
             block_size = 8192
             start_time = time.time()
@@ -147,6 +158,17 @@ class BilibiliEpisodeDownloader:
                     if chunk:
                         f.write(chunk)
                         downloaded_size += len(chunk)
+
+            # 完整性校验：实际字节数必须与 content-length 一致（连接中断时流会正常结束）
+            if total_size > 0 and downloaded_size != total_size:
+                try:
+                    os.remove(filename)
+                except OSError:
+                    pass
+                error_msg = (f"下载不完整: 已下载 {downloaded_size} 字节，"
+                             f"期望 {total_size} 字节")
+                logger.error(error_msg)
+                return False, error_msg
 
             total_time = time.time() - start_time
             avg_speed = downloaded_size / total_time / 1024 / 1024 if total_time > 0 else 0
@@ -188,45 +210,75 @@ class BilibiliEpisodeDownloader:
 
             ext = '.m4s'  # dash格式使用.m4s扩展名
 
-            # 2. 先检查缓存（使用EP ID+音频ID作为缓存键）
+            # 期望时长（ms），完整性校验用；缺失时降级为仅可解码性校验
+            expected_ms = audio_info.get('timelength')
+
+            # 2. 先检查缓存（使用EP ID+音频ID作为缓存键），命中时校验完整性
             ep_id_str = f"ep{id}"
             cached_file = cache_manager.get_cached_file(None, ep_id_str, ext, str(audio_info['id']))
             if cached_file:
-                logger.info(f"使用缓存文件: {cached_file}")
-                return True, {
-                    "file_path": cached_file,
-                    "audio_url": f"cached://{ep_id_str}_{audio_info['id']}",
-                    "audio_id": str(audio_info['id'])
-                }
+                ok, detail = verify_audio_file(cached_file, expected_duration_ms=expected_ms)
+                if ok:
+                    logger.info(f"使用缓存文件: {cached_file}")
+                    return True, {
+                        "file_path": cached_file,
+                        "audio_url": f"cached://{ep_id_str}_{audio_info['id']}",
+                        "audio_id": str(audio_info['id'])
+                    }
+                # 缓存文件不完整（历史截断残留），删除后走重新下载
+                logger.warning(f"缓存文件校验失败，删除后重新下载: {cached_file} - {detail}")
+                try:
+                    os.remove(cached_file)
+                except OSError as e:
+                    logger.warning(f"删除不完整缓存文件失败: {e}")
 
-            # 3. 如果没有缓存，获取完整的音频URL进行下载
-            logger.info(f"获取音频URL: ep{id}")
-            result = self.get_audio_url(id, cookie)
-
-            if not result:
-                return False, "无法获取音频URL"
-
-            audio_url, _ = result
-            logger.info(f"音频ID: {audio_info['id']}, 比特率: {audio_info['bandwidth']/1000:.1f} kbps")
-
-            # 4. 准备保存路径
+            # 3. 准备保存路径
             Path(save_dir).mkdir(exist_ok=True)
             filename = f"ep{id}_audio_{audio_info['id']}{ext}"
             filepath = os.path.join(save_dir, filename)
 
-            # 5. 下载文件
-            success, result = self.download_audio(audio_url, cookie, filepath)
+            # 4. 下载 + 校验，失败重试（每次重新获取URL，避免签名过期）
+            # 下载写到唯一临时名（并发同ID请求不互相踩踏），校验通过后原子落位
+            last_error = None
+            for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+                result = self.get_audio_url(id, cookie)
+                if not result:
+                    last_error = "无法获取音频URL"
+                    logger.warning(f"第 {attempt}/{MAX_DOWNLOAD_ATTEMPTS} 次{last_error}")
+                    continue
 
-            if success:
-                # 6. 保存到缓存（使用EP ID+音频ID作为缓存键）
-                cached_path = cache_manager.save_to_cache(audio_url, result, ep_id_str, str(audio_info['id']))
-                return True, {
-                    "file_path": cached_path,
-                    "audio_url": audio_url,
-                    "audio_id": str(audio_info['id'])
-                }
-            else:
-                return False, result
+                audio_url, _ = result
+                # 临时名含 pid+线程id，跨进程/线程并发同 ID 请求不互相踩踏
+                part_path = f"{filepath}.{os.getpid()}.{threading.get_ident()}.part{attempt}"
+                logger.info(f"音频ID: {audio_info['id']}, 比特率: {audio_info['bandwidth']/1000:.1f} kbps")
+
+                success, dl_result = self.download_audio(audio_url, cookie, part_path)
+                if not success:
+                    last_error = f"下载失败: {dl_result}"
+                    logger.warning(f"第 {attempt}/{MAX_DOWNLOAD_ATTEMPTS} 次{last_error}")
+                    continue
+
+                # 5. 下载完成，校验音频时长完整性
+                ok, detail = verify_audio_file(part_path, expected_duration_ms=expected_ms)
+                if ok:
+                    logger.info(detail)
+                    # 原子落位到正式文件名
+                    os.replace(part_path, filepath)
+                    # 6. 保存到缓存（使用EP ID+音频ID作为缓存键）
+                    cached_path = cache_manager.save_to_cache(audio_url, filepath, ep_id_str, str(audio_info['id']))
+                    return True, {
+                        "file_path": cached_path,
+                        "audio_url": audio_url,
+                        "audio_id": str(audio_info['id'])
+                    }
+                last_error = detail
+                logger.warning(f"第 {attempt}/{MAX_DOWNLOAD_ATTEMPTS} 次下载校验失败: {detail}")
+                try:
+                    os.remove(part_path)
+                except OSError as e:
+                    logger.warning(f"删除不完整文件失败: {e}")
+
+            return False, f"{last_error}（已尝试 {MAX_DOWNLOAD_ATTEMPTS} 次）"
 
         except Exception as e:
             logger.error(f"下载流程失败: {e}")

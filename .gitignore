@@ -131,6 +131,8 @@ test/*.m4a
 test/*.flac
 test/*.ogg
 test/*
+!test/test_download_integrity.py
+!test/test_downloader_integrity.py
 
 # Config files (keep only the example)
 config.yaml
