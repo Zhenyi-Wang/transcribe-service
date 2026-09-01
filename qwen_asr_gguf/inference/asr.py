@@ -434,9 +434,12 @@ class QwenASREngine:
             # 解析输出：自动检测模式下首 chunk 需提取语言
             chunk_lang, chunk_text = self._parse_asr_output(res.text, user_language=effective_language)
             if not detected_language and chunk_lang:
-                detected_language = chunk_lang
-                if self.verbose:
-                    print(f"\n[语言检测] 自动检测到语言: {detected_language}")
+                # 过滤模型输出的无效语言值（llama.cpp 新版本解码偶发输出 "language None"，
+                # 字符串 "None" 会一路传到 aligner 触发 validate_language 崩溃）
+                if chunk_lang.strip().lower() not in ("none", "unknown", "null"):
+                    detected_language = chunk_lang
+                    if self.verbose:
+                        print(f"\n[语言检测] 自动检测到语言: {detected_language}")
 
             # 更新记忆与统计（仅存储纯文本，不含语言元数据）
             all_segments[i].text = chunk_text

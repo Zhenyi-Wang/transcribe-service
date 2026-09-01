@@ -277,10 +277,13 @@ class QwenForcedAligner:
 
     def align(self, audio: np.ndarray, text: str, language: str = "Chinese", offset_sec: float = 0.0) -> ForcedAlignResult:
         """执行强制对齐，支持起始偏移量叠加"""
-        # 语言归一化与校验
+        # 语言归一化与校验（"None"/"unknown" 等无效值视为未检测，走通用分词，避免 validate 崩溃）
         if language:
             language = normalize_language_name(language)
-            validate_language(language)
+            if language.lower() in ("none", "unknown", "null"):
+                language = None
+            else:
+                validate_language(language)
 
         t_start = time.time()
         
