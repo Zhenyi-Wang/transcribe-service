@@ -1,0 +1,68 @@
+{
+ "audio": "/home/zhenyi/ownprojects/transcribe-service/test/test.mp3",
+ "llm": "qwen3_asr_llm.q4_k.gguf",
+ "runs": [
+  {
+   "run": 1,
+   "rtf": 0.029,
+   "wall_s": 3.28,
+   "encode_s": 0.41,
+   "prefill_s": 0.11,
+   "prefill_tokens": 3497,
+   "decode_s": 1.84,
+   "decode_tokens": 339,
+   "align_s": 0.86,
+   "text_len": 475
+  },
+  {
+   "run": 2,
+   "rtf": 0.0264,
+   "wall_s": 2.98,
+   "encode_s": 0.39,
+   "prefill_s": 0.05,
+   "prefill_tokens": 3491,
+   "decode_s": 1.87,
+   "decode_tokens": 331,
+   "align_s": 0.64,
+   "text_len": 468
+  },
+  {
+   "run": 3,
+   "rtf": 0.0263,
+   "wall_s": 2.97,
+   "encode_s": 0.39,
+   "prefill_s": 0.05,
+   "prefill_tokens": 3492,
+   "decode_s": 1.87,
+   "decode_tokens": 332,
+   "align_s": 0.62,
+   "text_len": 469
+  },
+  {
+   "run": 4,
+   "rtf": 0.0262,
+   "wall_s": 2.96,
+   "encode_s": 0.4,
+   "prefill_s": 0.06,
+   "prefill_tokens": 3394,
+   "decode_s": 1.83,
+   "decode_tokens": 331,
+   "align_s": 0.64,
+   "text_len": 471
+  },
+  {
+   "run": 5,
+   "rtf": 0.0259,
+   "wall_s": 2.93,
+   "encode_s": 0.39,
+   "prefill_s": 0.05,
+   "prefill_tokens": 3490,
+   "decode_s": 1.84,
+   "decode_tokens": 332,
+   "align_s": 0.6,
+   "text_len": 467
+  }
+ ],
+ "avg_rtf": 0.0268,
+ "lib_mtime": "20260901_1710"
+}
