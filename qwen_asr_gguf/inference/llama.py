@@ -27,34 +27,42 @@ llama_pos = ctypes.c_int32
 llama_seq_id = ctypes.c_int32
 
 class llama_model_params(ctypes.Structure):
+    """同步 llama.cpp master (2026-08-31, 518b7623) ABI：删 use_mmap/use_direct_io/use_mlock，
+    新增 load_mode/lazy_mode/load_mtp。旧版对齐 lib 时勿删此注释（升级锚点）。"""
     _fields_ = [
         ("devices", ctypes.POINTER(ctypes.c_void_p)),
         ("tensor_buft_overrides", ctypes.POINTER(ctypes.c_void_p)),
         ("n_gpu_layers", ctypes.c_int32),
         ("split_mode", ctypes.c_int32),
+        ("load_mode", ctypes.c_int32),   # llama_load_mode: 0=MMAP
+        ("lazy_mode", ctypes.c_int32),   # llama_lazy_mode
         ("main_gpu", ctypes.c_int32),
         ("tensor_split", ctypes.POINTER(ctypes.c_float)),
         ("progress_callback", ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_float, ctypes.c_void_p)),
         ("progress_callback_user_data", ctypes.c_void_p),
         ("kv_overrides", ctypes.POINTER(ctypes.c_void_p)),
         ("vocab_only", ctypes.c_bool),
-        ("use_mmap", ctypes.c_bool),
-        ("use_direct_io", ctypes.c_bool),
-        ("use_mlock", ctypes.c_bool),
         ("check_tensors", ctypes.c_bool),
         ("use_extra_bufts", ctypes.c_bool),
         ("no_host", ctypes.c_bool),
         ("no_alloc", ctypes.c_bool),
+        ("load_mtp", ctypes.c_bool),
     ]
 
 class llama_context_params(ctypes.Structure):
+    """同步 llama.cpp master (2026-08-31, 518b7623) ABI：n_seq_max 后新增 n_rs_seq/n_outputs_max/
+    n_outputs_max_per_seq，n_threads_batch 后新增 ctx_type，末尾新增 ctx_other。"""
     _fields_ = [
         ("n_ctx", ctypes.c_uint32),
         ("n_batch", ctypes.c_uint32),
         ("n_ubatch", ctypes.c_uint32),
         ("n_seq_max", ctypes.c_uint32),
+        ("n_rs_seq", ctypes.c_uint32),
+        ("n_outputs_max", ctypes.c_uint32),
+        ("n_outputs_max_per_seq", ctypes.c_uint32),
         ("n_threads", ctypes.c_int32),
         ("n_threads_batch", ctypes.c_int32),
+        ("ctx_type", ctypes.c_int32),   # llama_context_type: 0=MAIN
         ("rope_scaling_type", ctypes.c_int32),
         ("pooling_type", ctypes.c_int32),
         ("attention_type", ctypes.c_int32),
@@ -69,7 +77,7 @@ class llama_context_params(ctypes.Structure):
         ("defrag_thold", ctypes.c_float),
         ("cb_eval", ctypes.c_void_p),
         ("cb_eval_user_data", ctypes.c_void_p),
-        ("type_k", ctypes.c_int32),
+        ("type_k", ctypes.c_int32),     # ggml_type: 1=F16, 8=Q8_0 (KV 量化)
         ("type_v", ctypes.c_int32),
         ("abort_callback", ctypes.c_void_p),
         ("abort_callback_data", ctypes.c_void_p),
@@ -81,6 +89,7 @@ class llama_context_params(ctypes.Structure):
         ("kv_unified", ctypes.c_bool),
         ("samplers", ctypes.POINTER(ctypes.c_void_p)),
         ("n_samplers", ctypes.c_size_t),
+        ("ctx_other", ctypes.c_void_p),
     ]
 
 class llama_sampler_chain_params(ctypes.Structure):
@@ -529,7 +538,7 @@ class LlamaContext:
     def __init__(self, model, n_ctx=2048, n_batch=2048, n_ubatch=512, n_seq_max=1,
                  embeddings=False, pooling_type=0, flash_attn=True,
                  offload_kqv=True, no_perf=True, n_threads=None, n_threads_batch=None,
-                 attention_type=-1):  # -1=UNSPECIFIED, 0=CAUSAL, 1=NON_CAUSAL
+                 attention_type=-1, type_k=1, type_v=1):  # -1=UNSPECIFIED, 0=CAUSAL, 1=NON_CAUSAL
         self.model = model # 保持模型引用防止被释放
         params = llama_context_default_params()
         params.n_ctx = n_ctx
@@ -542,6 +551,8 @@ class LlamaContext:
         params.offload_kqv = offload_kqv
         params.no_perf = no_perf
         params.attention_type = attention_type
+        params.type_k = type_k      # ggml_type: 1=F16, 8=Q8_0（KV 量化，省显存）
+        params.type_v = type_v
         
         # 线程配置
         cpu_count = os.cpu_count() or 4

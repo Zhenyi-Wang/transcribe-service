@@ -262,7 +262,8 @@ class QwenForcedAligner:
         required_ctx = n_batch + 4096
         if config.n_ctx < required_ctx:
             config.n_ctx = required_ctx
-        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=n_batch, n_ubatch=n_ubatch, embeddings=False, attention_type=0)
+        kv_type = 8 if os.environ.get("QWEN_ASR_KV_Q8", "0") == "1" else 1  # Q8_0 / F16
+        self.ctx = llama.LlamaContext(self.model, n_ctx=config.n_ctx, n_batch=n_batch, n_ubatch=n_ubatch, embeddings=False, attention_type=0, type_k=kv_type, type_v=kv_type)
         # 诊断用：记录 context 容量，供 align 越界检查（GGML get_rows 索引越界定位）
         self.n_batch = n_batch
         self.n_ubatch = n_ubatch
