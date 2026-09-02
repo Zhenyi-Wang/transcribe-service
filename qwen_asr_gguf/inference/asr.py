@@ -7,8 +7,7 @@ import codecs
 import dataclasses
 import numpy as np
 import multiprocessing as mp
-from pathlib import Path
-from collections import deque
+from collections import Counter, deque
 from typing import Optional, List
 
 from .schema import MsgType, StreamingMessage, DecodeResult, ASREngineConfig, TranscribeResult, ForcedAlignItem, ForcedAlignResult
@@ -16,6 +15,50 @@ from .utils import normalize_language_name, validate_language
 from .encoder import QwenAudioEncoder
 from . import llama
 from . import logger
+
+# 词组级循环检测阈值：最常见的 5-gram 至少连续等距出现 N 次才判为循环。
+# 真实内容的密集重复（敬拜歌词副歌等）实测最多 ~12 次，幻觉循环实测 60+ 次，
+# 默认 20 取安全边际；环境变量可调（0 关闭检测）。
+LOOP_MIN_REPEAT = int(os.environ.get("QWEN_ASR_LOOP_MIN_REPEAT", "20"))
+
+
+def _detect_tail_loop(text: str, ngram: int = 5, min_repeat: int = None) -> Optional[int]:
+    """检测文本尾部的词组级循环，返回截断点（循环起始偏移），无循环返回 None。
+
+    _decode 内的 token 熔断（尾部 15 token 中 <=3 种）只对单字符级死循环有效；
+    词组级循环（如末尾音乐段复读歌词"你们的喜乐，你们的荣耀，"）token 多样性
+    高于该阈值，会一路跑满 512 token 上限（2026-09 祷告会唱诗事故）。
+
+    判据：最常见的 ngram 出现 >= min_repeat 次，且尾部出现位置严格等距
+    （循环周期固定）。要求等距可排除"副歌间隔重复但中间夹其他歌词"的真实内容。
+    """
+    if min_repeat is None:
+        min_repeat = LOOP_MIN_REPEAT
+    if min_repeat <= 0:
+        return None
+    n = len(text)
+    if n < ngram * min_repeat:
+        return None
+    counts = Counter(text[i:i + ngram] for i in range(n - ngram + 1))
+    gram, cnt = counts.most_common(1)[0]
+    if cnt < min_repeat:
+        return None
+    pos = []
+    i = text.find(gram)
+    while i >= 0:
+        pos.append(i)
+        i = text.find(gram, i + 1)
+    if len(pos) < min_repeat:
+        return None
+    step = pos[-1] - pos[-2]
+    run = 2
+    k = len(pos) - 2
+    while k > 0 and pos[k] - pos[k - 1] == step:
+        run += 1
+        k -= 1
+    if run >= min_repeat:
+        return pos[-run]
+    return None
 
 @dataclasses.dataclass
 class ASRS_Segment:
@@ -440,6 +483,26 @@ class QwenASREngine:
                     detected_language = chunk_lang
                     if self.verbose:
                         print(f"\n[语言检测] 自动检测到语言: {detected_language}")
+
+            # 词组级循环检测与自愈：_decode 内的 token 熔断只防单字符级死循环，
+            # 词组级循环（末尾音乐段复读歌词）会一路跑满 512 token 上限。先清
+            # 上下文重试一次（prefix 中的循环文本会自我强化，whisper.cpp #3744
+            # 同思路），仍失败则截断到循环起点保留正常开头；截断后的文本进入
+            # memory，防止循环文本污染后续 chunk。
+            loop_cut = _detect_tail_loop(chunk_text)
+            if loop_cut is not None:
+                logger.warning(
+                    f"[ASR] chunk {i}: 检测到词组级循环（截断点 {loop_cut}/{len(chunk_text)} 字），清上下文重试"
+                )
+                retry_embd = self._build_prompt_embd(audio_feature, "", context, effective_language)
+                res_retry = self._safe_decode(retry_embd, "", rollback_num, was_last, temperature + 0.3)
+                _, retry_text = self._parse_asr_output(res_retry.text, user_language=effective_language)
+                if retry_text.strip() and _detect_tail_loop(retry_text) is None:
+                    logger.warning(f"[ASR] chunk {i}: 重试成功（{len(retry_text)} 字）")
+                    chunk_text = retry_text
+                else:
+                    logger.warning(f"[ASR] chunk {i}: 重试仍循环/为空，截断保留前 {loop_cut} 字")
+                    chunk_text = chunk_text[:loop_cut]
 
             # 更新记忆与统计（仅存储纯文本，不含语言元数据）
             all_segments[i].text = chunk_text
