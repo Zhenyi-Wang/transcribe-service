@@ -245,13 +245,14 @@ def generate_subtitle_segments(text, asr_result=None):
 
     return body
 
-def generate_subtitle_segments_from_timestamps(text: str, timestamps: list, lang: str = "zh") -> list:
+def generate_subtitle_segments_from_timestamps(text: str, timestamps: list, lang: str = "zh", audio_duration: float = None) -> list:
     """从统一格式的时间戳生成字幕段落
 
     Args:
         text: 转录文本（含标点）
         timestamps: 时间戳列表，格式为 [{"text": str, "start": float, "end": float}, ...]
         lang: 检测到的语言代码（zh/en/ja/ko 等），用于决定空格处理策略
+        audio_duration: 音频总时长（秒），用于钳制兜底估算段不超出音频末尾
 
     字级时间戳（GGUF/Qwen3-ASR，每段1字）需要按标点合并为短语；
     句级时间戳（FunASR，每段已是短语）直接使用。
@@ -268,7 +269,7 @@ def generate_subtitle_segments_from_timestamps(text: str, timestamps: list, lang
     avg_len = sum(len(ts.get("text", "")) for ts in timestamps[:10]) / min(len(timestamps), 10)
     if avg_len <= 2:
         if lang in _CJK_LANGS:
-            return _merge_char_timestamps(text, timestamps)
+            return _merge_char_timestamps(text, timestamps, audio_duration)
         # 非 CJK 语言的碎片级时间戳（Qwen3-ForcedAligner 对天城文按基字符+
         # 组合符号对齐，2026-08 印地语事故）：碎片保留空格，先按空格重组为
         # 词级，再走空格语言分段（其强制拆分兜底可防单条超长字幕）
@@ -326,7 +327,7 @@ def _regroup_fragments_by_space(timestamps: list) -> list:
     return words
 
 
-def _merge_char_timestamps(text: str, timestamps: list) -> list:
+def _merge_char_timestamps(text: str, timestamps: list, audio_duration: float = None) -> list:
     """将字级时间戳按标点合并为字幕段落
 
     策略：先按句末标点分句，再对过长句子按逗号拆分。
@@ -407,9 +408,17 @@ def _merge_char_timestamps(text: str, timestamps: list) -> list:
                 seg_to = seg_from + 0.5
             ts_offset = end_idx + 1
         else:
-            # 时间戳耗尽/失配：用上一段结束时间 + 按语速估算的时长兜底
+            # 时间戳耗尽/失配：用上一段结束时间 + 按语速估算的时长兜底。
+            # 估算段必须钳制到音频总时长：音乐复读导致时间戳耗尽时，估算会
+            # 一路推进超出音频实际长度（2026-09 祷告会事故，尾部 30 段幻影
+            # 时间戳超出音频 45s）。超界段钉在音频末尾，文本一个不丢。
             seg_from = last_end_time
             seg_to = last_end_time + max(seg_len * 0.3, 1.0)
+            if audio_duration and audio_duration > 0:
+                if seg_from >= audio_duration:
+                    seg_from = seg_to = audio_duration
+                elif seg_to > audio_duration:
+                    seg_to = audio_duration
 
         body.append({
             "from": round(seg_from, 2),
@@ -645,7 +654,7 @@ class TranscriptionService:
             # 4. 生成字幕格式
             subtitle_start = time.time()
             if timestamps:
-                subtitle_body = generate_subtitle_segments_from_timestamps(transcript_text, timestamps, detected_lang)
+                subtitle_body = generate_subtitle_segments_from_timestamps(transcript_text, timestamps, detected_lang, audio_duration=audio_duration)
             else:
                 subtitle_body = generate_subtitle_segments(transcript_text)
             timing["subtitle_generate"] = time.time() - subtitle_start

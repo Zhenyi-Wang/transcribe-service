@@ -86,3 +86,44 @@ def test_empty_segments_and_zero_len():
     body = _merge_char_timestamps(text, ts)
     assert _body_text(body) == "阿门。！！！"
     assert len(body) == 1
+
+
+def test_fallback_clamped_to_audio_duration():
+    """兜底估算段钳制到音频总时长（2026-09 祷告会事故）。
+
+    场景：音乐复读导致时间戳耗尽，兜底按 0.3s/字推进，曾一路超出音频
+    实际时长 45s（尾部碎片时间戳到 8878.44s，音频只有 8832.98s）。
+    要求：传 audio_duration 后兜底段 to 不超过音频末尾；已越过末尾的段
+    钉在音频末尾（文本不丢）。
+    """
+    head = "耶和华是我的牧者。"          # 9 字，有真实时间戳
+    tail = "你们的喜乐，你们的荣耀，" * 20  # 120 字，无时间戳走兜底
+    text = head + tail
+    ts = _chars(re.sub(r'[^\w]', '', head))
+
+    body = _merge_char_timestamps(text, ts, audio_duration=13.0)
+
+    # 文本一个不丢
+    assert _body_text(body) == text
+    # 所有段时间不超音频末尾
+    for seg in body:
+        assert seg["to"] <= 13.0 + 1e-9, f"超界段: {seg}"
+    # 越过末尾的兜底段钉在末尾（from == to == 13.0）
+    pinned = [seg for seg in body if seg["from"] >= 13.0]
+    assert pinned, "应存在钉在末尾的兜底段"
+    for seg in pinned:
+        assert seg["from"] == seg["to"] == 13.0
+
+
+def test_fallback_without_duration_unchanged():
+    """不传 audio_duration 时行为与旧版一致（向后兼容）：兜底自由推进。"""
+    head = "耶和华是我的牧者。"
+    tail = "你们的喜乐，你们的荣耀，" * 20
+    text = head + tail
+    ts = _chars(re.sub(r'[^\w]', '', head))
+
+    body = _merge_char_timestamps(text, ts)
+    assert _body_text(body) == text
+    _assert_monotonic(body)
+    # 旧版无钳制：兜底段应向前推进且末段 to 明显大于前段（自由推进特征）
+    assert body[-1]["to"] > body[0]["to"]
