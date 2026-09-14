@@ -47,12 +47,13 @@ class ASRBackend(ABC):
         pass
 
     @abstractmethod
-    def transcribe(self, audio_file: str, language: str = None) -> TranscribeResult:
+    def transcribe(self, audio_file: str, language: str = None, context: str = None) -> TranscribeResult:
         """执行转录
 
         Args:
             audio_file: 音频文件路径
             language: 目标语言（可选，后端可能自动检测）
+            context: ASR 偏置文本（system 段；仅 gguf/asr-engine 后端消费，其余忽略）
 
         Returns:
             TranscribeResult: 统一格式的转录结果

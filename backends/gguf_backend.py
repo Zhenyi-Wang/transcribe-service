@@ -66,7 +66,7 @@ class GGUFBackend(ASRBackend):
             self._engine.shutdown()
             self._engine = None
 
-    def transcribe(self, audio_file: str, language: str = None) -> TranscribeResult:
+    def transcribe(self, audio_file: str, language: str = None, context: str = None) -> TranscribeResult:
         """执行转录（互斥，防止并发访问 llama.cpp 导致段错误）"""
         if not self._engine:
             raise RuntimeError("模型未加载，请先调用 load()")
@@ -80,7 +80,7 @@ class GGUFBackend(ASRBackend):
         try:
             t_start = time.time()
             with contextlib.redirect_stdout(io.StringIO()):
-                result = self._engine.transcribe(audio_file, language=language)
+                result = self._engine.transcribe(audio_file, language=language, context=context)
             t_total = time.time() - t_start
         finally:
             self._transcribe_lock.release()

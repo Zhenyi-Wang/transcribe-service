@@ -26,8 +26,8 @@ class CacheManager:
         else:
             logger.info("缓存已禁用")
 
-    def _get_cache_key(self, url: str = None, bvid: str = None, audio_id: str = None, file_path: str = None, page: int = 1) -> str:
-        """生成缓存键"""
+    def _get_cache_key(self, url: str = None, bvid: str = None, audio_id: str = None, file_path: str = None, page: int = 1, context: str = None) -> str:
+        """生成缓存键（context 非空时纳入派生，仅转录结果缓存链路传入）"""
         # 优先使用文件路径作为缓存键
         if file_path:
             content = file_path
@@ -43,6 +43,9 @@ class CacheManager:
         else:
             # 如果都没有，使用空字符串
             content = ""
+        if context:
+            # context 改变转录结果，必须参与 key；sha1[:10] 足够区分且不膨胀文件名
+            content = f"{content}#ctx:{hashlib.sha1(context.encode('utf-8')).hexdigest()[:10]}"
         return hashlib.md5(content.encode()).hexdigest()
 
     def _get_cache_path(self, cache_key: str, ext: str = '.mp3') -> Path:
@@ -101,19 +104,19 @@ class CacheManager:
             logger.error(f"缓存文件失败: {e}")
             return file_path
 
-    def get_cached_transcript(self, url: str = None, bvid: str = None, audio_id: str = None, file_path: str = None) -> Optional[Dict[str, Any]]:
+    def get_cached_transcript(self, url: str = None, bvid: str = None, audio_id: str = None, file_path: str = None, context: str = None) -> Optional[Dict[str, Any]]:
         """获取缓存的转录结果"""
         if not self.cache_enabled:
             return None
 
         # 优先使用文件路径作为缓存键
         if file_path:
-            cache_key = self._get_cache_key(file_path=file_path)
+            cache_key = self._get_cache_key(file_path=file_path, context=context)
         # 优先使用BVID+音频ID作为缓存键
         elif bvid and audio_id:
-            cache_key = self._get_cache_key(bvid=bvid, audio_id=audio_id)
+            cache_key = self._get_cache_key(bvid=bvid, audio_id=audio_id, context=context)
         else:
-            cache_key = self._get_cache_key(url=url, bvid=bvid)
+            cache_key = self._get_cache_key(url=url, bvid=bvid, context=context)
         cache_path = self.transcript_dir / f"{cache_key}.json"
 
         if cache_path.exists():
@@ -135,19 +138,19 @@ class CacheManager:
 
         return None
 
-    def save_transcript_to_cache(self, url: str = None, transcript_data: Dict[str, Any] = None, bvid: str = None, audio_id: str = None, file_path: str = None) -> None:
+    def save_transcript_to_cache(self, url: str = None, transcript_data: Dict[str, Any] = None, bvid: str = None, audio_id: str = None, file_path: str = None, context: str = None) -> None:
         """保存转录结果到缓存"""
         if not self.cache_enabled or not transcript_data:
             return
 
         # 优先使用文件路径作为缓存键
         if file_path:
-            cache_key = self._get_cache_key(file_path=file_path)
+            cache_key = self._get_cache_key(file_path=file_path, context=context)
         # 优先使用BVID+音频ID作为缓存键
         elif bvid and audio_id:
-            cache_key = self._get_cache_key(bvid=bvid, audio_id=audio_id)
+            cache_key = self._get_cache_key(bvid=bvid, audio_id=audio_id, context=context)
         else:
-            cache_key = self._get_cache_key(url=url, bvid=bvid)
+            cache_key = self._get_cache_key(url=url, bvid=bvid, context=context)
         cache_path = self.transcript_dir / f"{cache_key}.json"
 
         try:

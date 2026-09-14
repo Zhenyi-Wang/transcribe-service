@@ -134,6 +134,7 @@ class BilibiliTranscribeRequest(BaseModel):
     cookie: str
     no_cache: bool = False
     page: int = 1
+    context: Optional[str] = None  # ASR 偏置文本（标题/UP主/简介），可选
 
     class Config:
         populate_by_name = True
@@ -142,6 +143,7 @@ class BilibiliTranscribeRequest(BaseModel):
 class WebdavTranscribeRequest(BaseModel):
     path: str
     no_cache: bool = False
+    context: Optional[str] = None  # ASR 偏置文本（分类/作者/主题），可选
 
     class Config:
         populate_by_name = True
@@ -273,7 +275,7 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
         # 使用更友好的文件名用于日志显示，page 信息编码到 bvid 中确保缓存键唯一
         display_name = f"Bilibili_{request.bvid}_p{request.page}" if request.page > 1 else f"Bilibili_{request.bvid}"
         cache_bvid = f"{request.bvid}_p{request.page}" if request.page > 1 else request.bvid
-        result = await transcription_service.process_transcription(temp_filename, display_name, audio_url, cache_bvid, audio_id, request.no_cache)
+        result = await transcription_service.process_transcription(temp_filename, display_name, audio_url, cache_bvid, audio_id, request.no_cache, context=request.context)
 
         # 注入下载耗时到 timing
         if "timing" in result:
@@ -357,7 +359,8 @@ async def transcribe_webdav_file(request: WebdavTranscribeRequest):
             bvid=None,
             audio_id=None,
             no_cache=request.no_cache,
-            file_path_for_cache=full_file_path  # 传入完整路径用于缓存
+            file_path_for_cache=full_file_path,  # 传入完整路径用于缓存
+            context=request.context
         )
 
         return result

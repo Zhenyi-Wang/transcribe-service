@@ -54,7 +54,7 @@ class ASREngineClientBackend(ASRBackend):
     def unload(self) -> None:
         pass
 
-    def transcribe(self, audio_file: str, language: str = None) -> TranscribeResult:
+    def transcribe(self, audio_file: str, language: str = None, context: str = None) -> TranscribeResult:
         # 流式上传：直接把打开的文件对象传给 httpx，避免 f.read() 全量读入内存。
         # try 包裹整个 with open + httpx.post，确保 f 在 post 完成前一直存活（with 作用域内）。
         payload = None
@@ -67,6 +67,8 @@ class ASREngineClientBackend(ASRBackend):
                         "response_format": "verbose_json",
                         "timestamp_granularities": "word",
                     }
+                    if context:
+                        data["context"] = context
                     headers = {}
                     if self._token:
                         headers["Authorization"] = f"Bearer {self._token}"

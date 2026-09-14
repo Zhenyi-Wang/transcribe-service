@@ -19,6 +19,26 @@ LANG_MAP = {
     "Turkish": "tr", "Hindi": "hi", "Malay": "ms",
 }
 
+# ================= ASR context 钳制 =================
+# 与 qwen_asr_gguf 默认定容公式同源（chunk_size=40s / memory_num=1，当前无配置承载，
+# 两个 backend 均以库默认值构造；未来配置化时此处改为读取配置）。
+# frames_per_chunk = int(chunk_size*13)；n_ubatch = ceil((audio_frames+500)/512)*512
+# context 预算 = n_ubatch − audio_frames − 32（固定模板头尾），1 字符 ≈ 1 token 悲观换算
+_ASR_CTX_CHUNK_SIZE = 40.0
+_ASR_CTX_MEMORY_NUM = 1
+
+
+def clamp_asr_context(context):
+    """按引擎定容公式钳制 context 长度（理论上限；逐 chunk 精确拟合由引擎守卫负责）。"""
+    if not context:
+        return None
+    frames_per_chunk = int(_ASR_CTX_CHUNK_SIZE * 13)
+    audio_frames = frames_per_chunk * (_ASR_CTX_MEMORY_NUM + 1)
+    n_ubatch = max(512, ((audio_frames + 500 + 511) // 512) * 512)
+    budget = n_ubatch - audio_frames - 32
+    return context[:budget]
+
+
 def get_audio_duration(file_path: str) -> float:
     """获取音频文件的时长（秒）
 
@@ -547,8 +567,9 @@ class TranscriptionService:
     def __init__(self, model_manager):
         self.model_manager = model_manager
 
-    async def process_transcription(self, audio_file_path: str, original_filename: str = None, audio_url: str = None, bvid: str = None, audio_id: str = None, no_cache: bool = False, file_path_for_cache: str = None):
+    async def process_transcription(self, audio_file_path: str, original_filename: str = None, audio_url: str = None, bvid: str = None, audio_id: str = None, no_cache: bool = False, file_path_for_cache: str = None, context=None):
         """处理音频转录的主函数"""
+        context = clamp_asr_context(context)  # 理论上限钳制（精确拟合由引擎守卫负责）
         timing = {
             "cache_check": 0.0,
             "model_load": 0.0,
@@ -564,19 +585,19 @@ class TranscriptionService:
         cache_check_start = time.time()
         if not no_cache:
             if file_path_for_cache:
-                cached_result = cache_manager.get_cached_transcript(file_path=file_path_for_cache)
+                cached_result = cache_manager.get_cached_transcript(file_path=file_path_for_cache, context=context)
                 if cached_result:
                     cached_result.pop('cached_at', None)
                     logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
                     return cached_result
             elif audio_id and bvid:
-                cached_result = cache_manager.get_cached_transcript(None, bvid, audio_id)
+                cached_result = cache_manager.get_cached_transcript(None, bvid, audio_id, context=context)
                 if cached_result:
                     cached_result.pop('cached_at', None)
                     logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
                     return cached_result
             elif audio_url or bvid:
-                cached_result = cache_manager.get_cached_transcript(audio_url, bvid)
+                cached_result = cache_manager.get_cached_transcript(audio_url, bvid, context=context)
                 if cached_result:
                     cached_result.pop('cached_at', None)
                     logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
@@ -620,7 +641,7 @@ class TranscriptionService:
 
             # 3. 调用后端转录（在独立线程执行，避免阻塞事件循环）
             transcription_start_time = time.time()
-            result = await asyncio.to_thread(backend.transcribe, audio_file_path)
+            result = await asyncio.to_thread(backend.transcribe, audio_file_path, None, context)
             processing_time = time.time() - transcription_start_time
             timing["transcription"] = processing_time
 
@@ -683,11 +704,11 @@ class TranscriptionService:
             # 保存到缓存
             cache_save_start = time.time()
             if file_path_for_cache:
-                cache_manager.save_transcript_to_cache(file_path=file_path_for_cache, transcript_data=response)
+                cache_manager.save_transcript_to_cache(file_path=file_path_for_cache, transcript_data=response, context=context)
             elif audio_id and bvid:
-                cache_manager.save_transcript_to_cache(None, response, bvid, audio_id)
+                cache_manager.save_transcript_to_cache(None, response, bvid, audio_id, context=context)
             elif audio_url or bvid:
-                cache_manager.save_transcript_to_cache(audio_url, response, bvid)
+                cache_manager.save_transcript_to_cache(audio_url, response, bvid, context=context)
             timing["cache_save"] = time.time() - cache_save_start
             response["timing"]["cache_save"] = round(timing["cache_save"], 3)
             response["timing"]["total"] = round(time.time() - total_start, 3)

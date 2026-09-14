@@ -86,8 +86,10 @@ class Qwen3Backend(ASRBackend):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    def transcribe(self, audio_file: str, language: str = None) -> TranscribeResult:
-        """执行转录"""
+    def transcribe(self, audio_file: str, language: str = None, context: str = None) -> TranscribeResult:
+        """执行转录
+
+        context 接受但不使用（引擎不支持 context 偏置）"""
         if not self._model:
             raise RuntimeError("模型未加载，请先调用 load()")
 

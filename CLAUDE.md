@@ -21,9 +21,11 @@ bash run.sh --no-reload
 
 # 测试 API
 curl -X POST "http://localhost:31080/transcribe" -F "file=@test/test.mp3" -H "Authorization: Bearer ACG3_3hgbvsf"
+
+# /transcribe_file、/transcribe_url 支持可选 context 字段（ASR 偏置文本；按定容公式钳制 976 字符，转录结果缓存 key 纳入 context hash；2026-09-14）
 ```
 
-无 pytest/unittest 框架，测试为 `test/` 下的独立脚本。无 linting 配置。
+测试分两类：`test/` 独立脚本 + `tests/` pytest 套件（conda funasr 环境 `python -m pytest tests/ -q`，仓库根可直连导入）。无 linting 配置。
 
 ## Architecture
 
