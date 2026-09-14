@@ -154,13 +154,23 @@ class QwenASREngine:
         模型会自行输出 "language X\\n<asr_text>text" 格式，由 _parse_asr_output 解析。
         language 有值时进入强制模式：prompt 中包含 "language X<asr_text>"，
         模型直接输出纯文本。
+
+        引擎守卫：解码序列硬边界 total_len ≤ min(n_ubatch, n_batch//4)
+        （mrope pos_arr = total_len×4，超界即 get_rows 越界 SIGABRT）。
+        context 超预算时从尾部截断（head-keep），逐 chunk 自适应记忆文本长度。
         """
         def tk(t): return self.model.tokenize(t)
 
+        # 解码序列长度上限（prefill batch 双约束取严）
+        len_limit = min(self.n_ubatch, self.n_batch // 4)
+
         # 1. 区块 A: 音频之前的所有内容 (System + User Header)
-        prefix_str = f"system\n{context or 'You are a helpful assistant.'}"
-        prefix_tokens = [self.ID_IM_START] + tk(prefix_str) + [self.ID_IM_END] + \
-                        [self.ID_IM_START] + tk("user\n") + [self.ID_AUDIO_START]
+        #    先按原实现整段 tokenize（保证不截断时与既有路径逐 token 一致）
+        ctx_text = context or "You are a helpful assistant."
+        ctx_full_tokens = tk(f"system\n{ctx_text}")
+        audio_frames = audio_embd.shape[0]
+        # fixed = [IM_START, IM_END, IM_START] + "user\n" + [AUDIO_START]
+        fixed_nonctx = 3 + len(tk("user\n")) + 1
 
         # 2. 区块 B: 音频之后的所有内容 (Instruction + Assistant Header + History)
         suffix_head = f"assistant\n"
@@ -173,8 +183,29 @@ class QwenASREngine:
             suffix_tokens += [self.ID_ASR_TEXT]
         suffix_tokens += tk(prefix_text)
 
-        # 3. 统计并拼接
-        n_pre, n_aud, n_suf = len(prefix_tokens), audio_embd.shape[0], len(suffix_tokens)
+        # 3. 引擎守卫：超预算时拆分 tokenize 并从尾部截断 context（保留 "system\n" 头）
+        budget = len_limit - audio_frames - fixed_nonctx - len(suffix_tokens)
+        if len(ctx_full_tokens) > budget:
+            head_tokens = tk("system\n")
+            ctx_only = tk(ctx_text)
+            allowed = max(0, budget - len(head_tokens))
+            # 日志中 budget/截断至 均为扣除 "system\n" 头之后 context 自身的净预算/保留量，
+            # 与内部 budget 变量（含 head）相差 len(head_tokens)。
+            # 长音频逐 chunk 都会走到这里，仅首 chunk 记 warning 防刷屏（预算逐 chunk 自适应）。
+            if not getattr(self, "_ctx_guard_warned", False):
+                logger.warning(
+                    "[ASR-CTX-GUARD] context %d tokens > budget %d (audio=%d suffix=%d limit=%d)，尾部截断至 %d（本转录后续 chunk 静默）",
+                    len(ctx_only), max(budget - len(head_tokens), 0),
+                    audio_frames, len(suffix_tokens), len_limit, allowed,
+                )
+                self._ctx_guard_warned = True
+            ctx_full_tokens = head_tokens + ctx_only[:allowed]
+
+        prefix_tokens = [self.ID_IM_START] + ctx_full_tokens + [self.ID_IM_END] + \
+                        [self.ID_IM_START] + tk("user\n") + [self.ID_AUDIO_START]
+
+        # 4. 统计并拼接
+        n_pre, n_aud, n_suf = len(prefix_tokens), audio_frames, len(suffix_tokens)
         total_embd = np.zeros((n_pre + n_aud + n_suf, self.model.n_embd), dtype=np.float32)
 
         total_embd[:n_pre] = self.embedding_table[prefix_tokens]
@@ -442,6 +473,9 @@ class QwenASREngine:
             "encode_time": 0.0, "align_time": 0.0,
         }
         t_main_start = time.time()
+        # 每次转录重置守卫告警 flag：保证每条超预算转录都有一次 [ASR-CTX-GUARD] 日志，
+        # 同时单次转录内不逐 chunk 刷屏（引擎实例可能多日不卸载）
+        self._ctx_guard_warned = False
 
         # 语言检测状态：初始为用户提供的 language（可能为 None）
         detected_language = language
