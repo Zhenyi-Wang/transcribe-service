@@ -12,7 +12,7 @@ Qwen3-ASR 音频转录服务，提供 REST API 将音频文件和B站视频转�
 conda activate funasr
 
 # 服务化启动：幂等地在 tmux 'transcribe' 会话中运行 run.sh
-# （WSL 启动时由 systemd 用户单元 ~/.config/systemd/user/transcribe.service 自动执行）
+# （开机自动执行：.bashrc 末尾自启块按 boot_id 每开机周期拉起一次，2026-09-17 起替代 systemd 用户单元）
 bash start.sh
 
 # 前台直接跑（调试用；默认自动重载，加 --no-reload 关闭）
@@ -100,3 +100,7 @@ backend:
 - conda 环境 `funasr`，Python 3.10（`~/miniconda3/envs/funasr/bin/python`）
 - GPU: RTX 2080 Ti (Turing, compute capability 7.5, 无 BF16 支持)
 - Qwen3-ASR 的 `temperature` 警告来自 `qwen_asr` 库内部，不影响功能
+
+## 项目文档索引
+
+- [说话人识别集成可行性调查](docs/2026-09-23_speaker-diarization-feasibility.md) — 结论：可行；已实测（2026-09-23）：推荐「混合管线」pyannote GPU 分割 + wespeaker CN-Celeb 中文 ONNX embedding（RTF 0.027、显存 412MB、官方基准 4/4）；sherpa-onnx CPU 备选、sherpa GPU 实测更慢已排除；坑位：numpy 锁 1.26.4（2026-09-23）

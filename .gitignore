@@ -133,6 +133,10 @@ test/*.ogg
 test/*
 !test/test_download_integrity.py
 !test/test_downloader_integrity.py
+!test/diarization_*.py
+
+# 本机会话产物（Playwright MCP）
+.playwright-mcp/
 
 # Config files (keep only the example)
 config.yaml
