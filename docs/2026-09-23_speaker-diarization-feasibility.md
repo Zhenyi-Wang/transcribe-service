@@ -104,7 +104,7 @@ diarization:
   - `/transcribe_url`：`BilibiliTranscribeRequest` 加 `diarize: bool = False`
   - `/transcribe_file`：`WebdavTranscribeRequest` 加 `diarize: bool = False`
 - `diarize=true` 时响应新增三处：
-  - `body[].speaker`：int，聚类簇编号（0 起）；段跨说话人/重叠不过半 → `-1`（字段保持存在，schema 稳定）
+  - `body[].speaker`：int，聚类簇编号（0 起）。**词级后端路径（先分块再分句）每段必有明确 speaker，不出现 -1**；仅 funasr 句级退化路径在段跨说话人/重叠不过半时标 `-1`（字段保持存在，schema 稳定）
   - 顶层 `speakers`：汇总 `[{"id": 0, "duration": 120.5, "segments": 40}, ...]`，下游据此决定是否渲染
   - `timing.diarization`：分离阶段单独计时
 - **单人退化**：仅识别出 1 人 → body 不加 speaker 字段、顶层不加 speakers，响应与 `diarize=false` 一致（单人视频不加噪声标注）
@@ -118,7 +118,18 @@ diarize 开关参与缓存 key：追加 `#diar:1` 再 md5（照 `#ctx:` 范式�
 
 mryk24 的 NoteFlow 流水线经两条路径消费转录：B 站无字幕回退 `POST /transcribe_url`（`extractors/bilibili.ts:778-901`，body 原样 JSON 存 rawData）与 WebDAV `POST /transcribe_file`（`extractors/webdav.ts:70-206`）。下游 `clean.ts:19-27` 把 body 格式化为 `[mm:ss] content` 行（现只读 from+content）→ AI 总结 → `### ORIG` 入 Markdown。
 
-结合方式（约半天）：`NoteFlowConfig.funasr.diarize` 开关（默认 false）→ 两个 extractor body 加 `diarize: true` → 两个格式化点读 `item.speaker`（`>= 0` 时行内插 ` [说话人N]`）。增益自动传导：AI 总结获得对话结构、ORIG 可读性提升；TTS 只读 summary 不受影响；单人/`-1` 段自动退化为现状格式；B 站官方字幕路径不走转录、不受影响。
+结合方式（约半天）：`NoteFlowConfig.funasr.diarize` 开关（默认 false）→ 两个 extractor body 加 `diarize: true` → 两个格式化点改为**按说话人分组合并**（2026-09-24 定稿）：连续同 speaker 的段聚为一组，输出格式
+
+```
+【说话人1】
+[00:00] 内容...
+[00:45] 内容...
+
+【说话人2】
+[02:10] 内容...
+```
+
+边界规则：词级后端路径先按说话人分块再分句，**每段必有明确 speaker，分组仅按 speaker 变化触发**；`-1` 段仅存在于 funasr 句级退化路径（段级对齐失败），输出为无标注普通行（不赋给任何说话人、不打断当前组，下一个明确 speaker 才开新组）；无 speaker 字段（单人视频）完全无组标题，退化为现状格式。summarize prompt 同步加一句说明分组标题含义，总结时区分观点归属。增益自动传导：AI 总结获得对话结构、ORIG 可读性提升；TTS 只读 summary 不受影响；B 站官方字幕路径不走转录、不受影响。
 
 ### 4.6 二期扩展：声纹注册
 
@@ -167,7 +178,7 @@ mryk24 的 NoteFlow 流水线经两条路径消费转录：B 站无字幕回退 
 | 阶段 | 内容 | 工作量 |
 |------|------|--------|
 | ~~0. 验证实验~~ | ~~四方案实测~~ | 已完成（§5） |
-| 1. 基础版 | diarization/ 模块（pyannote-hybrid 默认 + sherpa-onnx 备选，统一接口）+ config 组 + 三端点 `diarize` 参数 + **先按说话人分块再分句**（词级后端）/ 段级对齐（funasr 退化路径）+ body speaker 字段 + 缓存 key + 单人退化 + pytest | 2~3 天 |
+| ~~1. 基础版~~ | ~~diarization/ 模块（pyannote-hybrid）+ config 组 + 三端点 `diarize` 参数 + 先按说话人分块再分句 / funasr 段级对齐退化 + body speaker 字段 + 缓存 key + 单人退化 + pytest~~ | **已实施**（2026-09-24，见 plans/2026-09-24-speaker-diarization.md；验收：4 人音频正确聚类、世相单人退化、并行 total≈max） |
 | 2. 打磨 | prefix 输出模式、num_speakers 透传、更多 B 站样本验收 | ~1 天 |
 | 3. 二期（可选） | 声纹注册命名 | ~1 天 |
 
