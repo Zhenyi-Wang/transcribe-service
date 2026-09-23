@@ -59,3 +59,13 @@ api:
 # 网盘配置
 webdav:
   base_path: "/mnt/webdav"  # webdav挂载路径
+
+# 说话人分离（可选，diarize=true 请求参数触发）
+diarization:
+  enabled: false
+  backend: pyannote-hybrid      # 唯一实现；其他值走禁用降级
+  cluster_threshold: 0.7046     # 聚类距离阈值
+  min_cluster_size: 12
+  num_speakers: -1              # -1 自动
+  embedding_model: "~/models/diarization/wespeaker_cnceleb_resnet34_LM.onnx"
+  hf_token: ""                  # 空 = 默认凭据链（~/.cache/huggingface/token）

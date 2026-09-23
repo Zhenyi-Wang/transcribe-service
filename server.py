@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
@@ -135,6 +135,7 @@ class BilibiliTranscribeRequest(BaseModel):
     no_cache: bool = False
     page: int = 1
     context: Optional[str] = None  # ASR 偏置文本（标题/UP主/简介），可选
+    diarize: bool = False  # 说话人分离（显式传入才启用）
 
     class Config:
         populate_by_name = True
@@ -144,6 +145,7 @@ class WebdavTranscribeRequest(BaseModel):
     path: str
     no_cache: bool = False
     context: Optional[str] = None  # ASR 偏置文本（分类/作者/主题），可选
+    diarize: bool = False  # 说话人分离（显式传入才启用）
 
     class Config:
         populate_by_name = True
@@ -215,7 +217,7 @@ async def token_validation_middleware(request: Request, call_next):
     return response
 
 @app.post("/transcribe")
-async def transcribe_audio(file: UploadFile = File(...)):
+async def transcribe_audio(file: UploadFile = File(...), diarize: bool = Form(False)):
     """上传音频文件转录接口"""
     # 存临时文件
     temp_dir = get_temp_dir()
@@ -226,7 +228,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
             shutil.copyfileobj(file.file, buffer)
 
         # 使用转录服务处理
-        result = await transcription_service.process_transcription(str(temp_filename), file.filename)
+        result = await transcription_service.process_transcription(str(temp_filename), file.filename, diarize=diarize)
 
         return result
     finally:
@@ -275,7 +277,7 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
         # 使用更友好的文件名用于日志显示，page 信息编码到 bvid 中确保缓存键唯一
         display_name = f"Bilibili_{request.bvid}_p{request.page}" if request.page > 1 else f"Bilibili_{request.bvid}"
         cache_bvid = f"{request.bvid}_p{request.page}" if request.page > 1 else request.bvid
-        result = await transcription_service.process_transcription(temp_filename, display_name, audio_url, cache_bvid, audio_id, request.no_cache, context=request.context)
+        result = await transcription_service.process_transcription(temp_filename, display_name, audio_url, cache_bvid, audio_id, request.no_cache, context=request.context, diarize=request.diarize)
 
         # 注入下载耗时到 timing
         if "timing" in result:
@@ -360,7 +362,8 @@ async def transcribe_webdav_file(request: WebdavTranscribeRequest):
             audio_id=None,
             no_cache=request.no_cache,
             file_path_for_cache=full_file_path,  # 传入完整路径用于缓存
-            context=request.context
+            context=request.context,
+            diarize=request.diarize
         )
 
         return result

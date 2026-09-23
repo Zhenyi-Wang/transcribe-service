@@ -106,6 +106,42 @@ class Config:
         """ASR-Engine 访问令牌（留空=不鉴权）"""
         return self.get('asr_engine.token', '')
 
+    # ========== 说话人分离配置 ==========
+    @property
+    def diarization_enabled(self) -> bool:
+        """是否启用说话人分离"""
+        return self.get('diarization.enabled', False)
+
+    @property
+    def diarization_backend(self) -> str:
+        """分离后端（当前唯一实现 pyannote-hybrid；非法值走禁用降级）"""
+        return self.get('diarization.backend', 'pyannote-hybrid')
+
+    @property
+    def diarization_cluster_threshold(self) -> float:
+        """聚类距离阈值（pyannote 默认 0.7046）"""
+        return self.get('diarization.cluster_threshold', 0.7046)
+
+    @property
+    def diarization_min_cluster_size(self) -> int:
+        """聚类最小簇大小（帧）"""
+        return self.get('diarization.min_cluster_size', 12)
+
+    @property
+    def diarization_num_speakers(self) -> int:
+        """说话人人数先验（-1 自动）"""
+        return self.get('diarization.num_speakers', -1)
+
+    @property
+    def diarization_embedding_model(self) -> str:
+        """声纹 embedding ONNX 路径（wespeaker CN-Celeb 中文）"""
+        return self.get('diarization.embedding_model', '~/models/diarization/wespeaker_cnceleb_resnet34_LM.onnx')
+
+    @property
+    def diarization_hf_token(self) -> str:
+        """HuggingFace token（gated segmentation 模型；空 = 默认凭据链）"""
+        return self.get('diarization.hf_token', '')
+
     # ========== 服务器配置 ==========
     @property
     def idle_timeout(self) -> int:

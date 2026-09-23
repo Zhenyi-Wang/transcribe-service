@@ -265,7 +265,63 @@ def generate_subtitle_segments(text, asr_result=None):
 
     return body
 
-def generate_subtitle_segments_from_timestamps(text: str, timestamps: list, lang: str = "zh", audio_duration: float = None) -> list:
+def _assign_speakers_to_timestamps(timestamps: list, turns: list) -> list:
+    """给每个时间戳项附加 speaker 键（spec 三级归属规则，不改输入 dict）
+
+    1. 与某 turn 有重叠 → 归重叠面积最大者（字主体归属优先）
+    2. 与所有 turn 无重叠（换人间隙/超范围）→ 归最近 turn（项中点到 turn 区间的距离）
+    """
+    def _nearest_speaker(t: float) -> int:
+        best_speaker, best_dist = None, float("inf")
+        for turn in turns:
+            d = max(turn.start - t, 0.0, t - turn.end)
+            if d < best_dist:
+                best_dist, best_speaker = d, turn.speaker
+        return best_speaker
+
+    out = []
+    for ts in timestamps:
+        s, e = ts.get("start", 0.0), ts.get("end", 0.0)
+        best_speaker, best_overlap = None, 0.0
+        for turn in turns:
+            overlap = min(e, turn.end) - max(s, turn.start)
+            if overlap > best_overlap:
+                best_overlap, best_speaker = overlap, turn.speaker
+        if best_speaker is None:
+            best_speaker = _nearest_speaker((s + e) / 2)
+        out.append({**ts, "speaker": best_speaker})
+    return out
+
+
+def _aggregate_speakers(body: list) -> list:
+    """从 body 段聚合说话人汇总；-1/缺失不计入，id 升序"""
+    stat = {}
+    for seg in body:
+        spk = seg.get("speaker")
+        if spk is None or spk < 0:
+            continue
+        d = stat.setdefault(spk, {"id": spk, "duration": 0.0, "segments": 0})
+        d["duration"] += seg.get("to", 0.0) - seg.get("from", 0.0)
+        d["segments"] += 1
+    return [{"id": d["id"], "duration": round(d["duration"], 1), "segments": d["segments"]}
+            for d in sorted(stat.values(), key=lambda x: x["id"])]
+
+
+def _posthoc_align_speakers(body: list, turns: list) -> list:
+    """句级段的后置说话人对齐：与 turn 最大重叠 ≥ 段时长 50% 才赋标签，否则 -1"""
+    for seg in body:
+        s, e = seg.get("from", 0.0), seg.get("to", 0.0)
+        best, best_ov = None, 0.0
+        for turn in turns:
+            ov = min(e, turn.end) - max(s, turn.start)
+            if ov > best_ov:
+                best_ov, best = ov, turn.speaker
+        seg["speaker"] = best if (best is not None and best_ov >= (e - s) * 0.5) else -1
+    return body
+
+
+def generate_subtitle_segments_from_timestamps(text: str, timestamps: list, lang: str = "zh",
+                                                audio_duration: float = None, turns: list = None) -> list:
     """从统一格式的时间戳生成字幕段落
 
     Args:
@@ -273,6 +329,8 @@ def generate_subtitle_segments_from_timestamps(text: str, timestamps: list, lang
         timestamps: 时间戳列表，格式为 [{"text": str, "start": float, "end": float}, ...]
         lang: 检测到的语言代码（zh/en/ja/ko 等），用于决定空格处理策略
         audio_duration: 音频总时长（秒），用于钳制兜底估算段不超出音频末尾
+        turns: SpeakerTurn 列表（diarize 结果）；None/单说话人时不注入 speaker，
+            行为与历史版本一致。
 
     字级时间戳（GGUF/Qwen3-ASR，每段1字）需要按标点合并为短语；
     句级时间戳（FunASR，每段已是短语）直接使用。
@@ -282,6 +340,12 @@ def generate_subtitle_segments_from_timestamps(text: str, timestamps: list, lang
     if not timestamps:
         return generate_subtitle_segments(text)
 
+    # speaker 模式判定：turns 有效且聚类 ≥2 人（单人退化），否则保持 timestamps 原样
+    speaker_mode = False
+    if turns and len({t.speaker for t in turns}) >= 2:
+        timestamps = _assign_speakers_to_timestamps(timestamps, turns)
+        speaker_mode = True
+
     # CJK 语言不使用空格分词，其他语言（英法德西等）使用空格
     _CJK_LANGS = {"zh", "ja", "ko", "yue", ""}
 
@@ -289,7 +353,8 @@ def generate_subtitle_segments_from_timestamps(text: str, timestamps: list, lang
     avg_len = sum(len(ts.get("text", "")) for ts in timestamps[:10]) / min(len(timestamps), 10)
     if avg_len <= 2:
         if lang in _CJK_LANGS:
-            return _merge_char_timestamps(text, timestamps, audio_duration)
+            body = _merge_char_timestamps(text, timestamps, audio_duration)
+            return body if speaker_mode else _strip_speaker(body)
         # 非 CJK 语言的碎片级时间戳（Qwen3-ForcedAligner 对天城文按基字符+
         # 组合符号对齐，2026-08 印地语事故）：碎片保留空格，先按空格重组为
         # 词级，再走空格语言分段（其强制拆分兜底可防单条超长字幕）
@@ -300,10 +365,34 @@ def generate_subtitle_segments_from_timestamps(text: str, timestamps: list, lang
     use_spaces = lang not in _CJK_LANGS
 
     if use_spaces:
-        return _segment_by_punctuation(timestamps, text)
+        body = _segment_by_punctuation(timestamps, text)
     else:
-        # 非空格语言（日/韩）：简单按 min_len 合并，不关注空格
-        return _segment_simple(timestamps, text)
+        # 非空格语言（日/韩）/ 句级（funasr）：简单按 min_len 合并
+        body = _segment_simple(timestamps, text)
+        if speaker_mode:
+            body = _posthoc_align_speakers(body, turns)
+    if speaker_mode:
+        return body
+    return _strip_speaker(body)
+
+
+def _strip_speaker(body: list) -> list:
+    """非 speaker 模式兜底：剥掉任何可能混入的 speaker 键（回归红线保障）"""
+    for seg in body:
+        seg.pop("speaker", None)
+    return body
+
+
+def _majority_speaker(intervals, w_start: float, w_end: float):
+    """[(start, end, speaker), ...] 中与 [w_start, w_end] 重叠最大者；全无 speaker 返回 None"""
+    best, best_ov = None, 0.0
+    for s, e, sp in intervals:
+        if sp is None:
+            continue
+        ov = min(w_end, e) - max(w_start, s)
+        if ov > best_ov:
+            best_ov, best = ov, sp
+    return best
 
 
 def _regroup_fragments_by_space(timestamps: list) -> list:
@@ -315,28 +404,30 @@ def _regroup_fragments_by_space(timestamps: list) -> list:
 
     Returns:
         词级时间戳列表 [{"text", "start", "end"}, ...]，text 保留单个尾随空格
-        （_segment_by_punctuation 依赖尾随空格判断词间距）；无可重组内容时为空列表
+        （_segment_by_punctuation 依赖尾随空格判断词间距）；无可重组内容时为空列表。
+        碎片带 speaker 键时，词继承重叠最大的碎片 speaker（跨说话人词取主体）。
     """
     words = []
-    current = []  # [(frag_text, start, end)]
+    current = []  # [(frag_text, start, end, speaker)]
 
     def _flush_word():
         if not current:
             return
         word_text = "".join(w[0] for w in current).rstrip()
         if word_text:
-            words.append({
-                "text": word_text + " ",
-                "start": current[0][1],
-                "end": current[-1][2],
-            })
+            w_start, w_end = current[0][1], current[-1][2]
+            spk = _majority_speaker([(s, e, sp) for (_, s, e, sp) in current], w_start, w_end)
+            entry = {"text": word_text + " ", "start": w_start, "end": w_end}
+            if spk is not None:
+                entry["speaker"] = spk
+            words.append(entry)
         current.clear()
 
     for ts in timestamps:
         frag = ts.get("text", "")
         if not frag:
             continue
-        current.append((frag, ts.get("start", 0), ts.get("end", 0)))
+        current.append((frag, ts.get("start", 0), ts.get("end", 0), ts.get("speaker")))
         if frag.endswith(" "):
             _flush_word()
     _flush_word()  # 尾部无空格的残余词
@@ -401,6 +492,7 @@ def _merge_char_timestamps(text: str, timestamps: list, audio_duration: float = 
     body = []
     ts_offset = 0
     last_end_time = 0.0  # 上一段（含兜底段）的结束时间，兜底段从此推进
+    last_speaker = None  # 上一段（含兜底段）的说话人，估算兜底段继承
 
     for seg_text in segments:
         # 去掉标点后的纯文本长度，用于在 ts_chars 中定位
@@ -422,11 +514,57 @@ def _merge_char_timestamps(text: str, timestamps: list, audio_duration: float = 
             # 有真实时间戳：取首尾字时间
             start_idx = match_pos
             end_idx = min(match_pos + seg_len - 1, len(timestamps) - 1)
+            ts_offset = end_idx + 1
+
+            # speaker 模式：项带 speaker 键且段内存在变化 → 段内边界拆分。
+            # 拆分不破坏全局对齐：各子段 clean 文本拼接 == 原 clean_seg，
+            # 子段时间范围取各自首尾项，ts_offset 推进不变。
+            range_speakers = [timestamps[i].get("speaker") for i in range(start_idx, end_idx + 1)]
+            if any(sp is not None for sp in range_speakers) and len(set(range_speakers)) > 1:
+                # 组边界 = speaker 变化的项索引
+                cuts = [start_idx]
+                for k in range(1, len(range_speakers)):
+                    if range_speakers[k] != range_speakers[k - 1]:
+                        cuts.append(start_idx + k)
+                cuts.append(end_idx + 1)
+                # 把 seg_text 按 clean 字符切分位置切成含标点子串（标点跟随前一个 clean 字符）
+                cut_clean_pos = {c - start_idx for c in cuts[1:-1]}
+                text_parts = []
+                buf, ci = [], 0
+                for ch in seg_text:
+                    if re.match(r'[\w]', ch, flags=re.UNICODE):
+                        if ci in cut_clean_pos and buf:
+                            text_parts.append("".join(buf))
+                            buf = []
+                        ci += 1
+                    buf.append(ch)
+                text_parts.append("".join(buf))
+                text_parts = [p for p in text_parts if p.strip()]
+
+                for gi in range(len(cuts) - 1):
+                    g_start, g_end = cuts[gi], cuts[gi + 1] - 1  # 项索引闭区间
+                    sub_speaker = range_speakers[g_start - start_idx]
+                    body.append({
+                        "from": round(timestamps[g_start].get("start", 0), 2),
+                        "to": round(timestamps[g_end].get("end", 0), 2),
+                        "sid": len(body) + 1,
+                        "location": 2,
+                        "content": text_parts[gi] if gi < len(text_parts) else "",
+                        "music": 0,
+                        "speaker": sub_speaker,
+                    })
+                last_end_time = max(last_end_time, timestamps[end_idx].get("end", 0))
+                last_speaker = range_speakers[-1]  # 拆分后更新，供后续估算兜底段继承
+                continue
+
             seg_from = timestamps[start_idx].get("start", 0)
             seg_to = timestamps[end_idx].get("end", 0)
             if seg_to <= seg_from:
                 seg_to = seg_from + 0.5
-            ts_offset = end_idx + 1
+            # speaker 模式下，正常段附加段内（恒一的）speaker
+            range_speakers = [timestamps[i].get("speaker") for i in range(start_idx, end_idx + 1)]
+            known = [sp for sp in range_speakers if sp is not None]
+            body_extra = {"speaker": known[0]} if known else {}
         else:
             # 时间戳耗尽/失配：用上一段结束时间 + 按语速估算的时长兜底。
             # 估算段必须钳制到音频总时长：音乐复读导致时间戳耗尽时，估算会
@@ -439,6 +577,7 @@ def _merge_char_timestamps(text: str, timestamps: list, audio_duration: float = 
                     seg_from = seg_to = audio_duration
                 elif seg_to > audio_duration:
                     seg_to = audio_duration
+            body_extra = {"speaker": last_speaker} if last_speaker is not None else {}
 
         body.append({
             "from": round(seg_from, 2),
@@ -446,9 +585,12 @@ def _merge_char_timestamps(text: str, timestamps: list, audio_duration: float = 
             "sid": len(body) + 1,
             "location": 2,
             "content": seg_text,
-            "music": 0
+            "music": 0,
+            **body_extra,
         })
         last_end_time = max(last_end_time, seg_to)
+        if body_extra.get("speaker") is not None:
+            last_speaker = body_extra["speaker"]
 
     return body if body else generate_subtitle_segments(text)
 
@@ -485,12 +627,15 @@ def _segment_by_punctuation(timestamps: list, text: str) -> list:
     段落过长时在逗号/分号（,;:）处 flush；
     无标点的超长段落按 max_len*3 强制 flush 避免单段过长。
     单独标点项（",", "." 等）总是附加到当前段落，不独立成段。
+    item 带 speaker 键时（说话人模式），相邻项 speaker 变化同样触发 flush，
+    段落继承其成员词的（恒一的）speaker。
     """
     import re
     max_len = config.max_segment_length
+    has_speaker = any("speaker" in ts for ts in timestamps)
 
     body = []
-    # current_words: [(word_text, start_time, end_time)]
+    # current_words: [(word_text, start_time, end_time, speaker)]
     # word_text 对于段首词不含前置空格，后续词含前置空格
     current_words = []
     pending_space = False
@@ -499,14 +644,17 @@ def _segment_by_punctuation(timestamps: list, text: str) -> list:
         if not current_words:
             return
         content = "".join(w[0] for w in current_words)
-        body.append({
+        entry = {
             "from": round(current_words[0][1], 2),
             "to": round(current_words[-1][2], 2),
             "sid": 0,
             "location": 2,
             "content": content,
             "music": 0
-        })
+        }
+        if has_speaker and current_words[0][3] is not None:
+            entry["speaker"] = current_words[0][3]
+        body.append(entry)
         current_words.clear()
 
     def _is_punct_only(s: str) -> bool:
@@ -523,7 +671,7 @@ def _segment_by_punctuation(timestamps: list, text: str) -> list:
         # 单独标点项：总是附加到当前段落，不出现在段首
         if _is_punct_only(seg_text):
             if current_words:
-                current_words.append((seg_text, ts.get("start", 0), ts.get("end", 0)))
+                current_words.append((seg_text, ts.get("start", 0), ts.get("end", 0), ts.get("speaker")))
                 # 句末标点触发 flush，确保 "ID." 之类不被拆散（।॥ 为印地语句读）
                 if seg_text in '.!?।॥':
                     _flush()
@@ -531,12 +679,17 @@ def _segment_by_punctuation(timestamps: list, text: str) -> list:
             pending_space = raw_text.rstrip() != raw_text
             continue
 
+        # 说话人模式：相邻词 speaker 变化 → flush 当前段再开新段
+        if has_speaker and current_words and \
+                current_words[-1][3] is not None and ts.get("speaker") != current_words[-1][3]:
+            _flush()
+
         # 构建词文本：段首词无前置空格，后续词根据 pending_space 决定
         word_text = (" " if pending_space and current_words else "") + seg_text
         start = ts.get("start", 0)
         end = ts.get("end", 0)
 
-        current_words.append((word_text, start, end))
+        current_words.append((word_text, start, end, ts.get("speaker")))
         total_len = sum(len(w[0]) for w in current_words)
 
         stripped = seg_text
@@ -561,15 +714,31 @@ def _segment_by_punctuation(timestamps: list, text: str) -> list:
     return body if body else generate_subtitle_segments(text)
 
 
+def _diarize_samples(audio_file_path: str):
+    """分离线程函数体：解码 + 推理（重依赖延迟导入；任何异常向上抛由编排层降级）"""
+    from qwen_asr_gguf.inference.audio import load_audio
+    from diarization.manager import get_manager
+    samples = load_audio(audio_file_path)
+    return get_manager().diarize(samples)
+
+
+def _diarize_timeout(audio_duration: float) -> float:
+    """分离超时上限（秒）：下限 60s，随音频时长放宽"""
+    return max(60.0, audio_duration * 0.5)
+
+
 class TranscriptionService:
     """转录服务类，封装所有转录相关逻辑"""
 
     def __init__(self, model_manager):
         self.model_manager = model_manager
 
-    async def process_transcription(self, audio_file_path: str, original_filename: str = None, audio_url: str = None, bvid: str = None, audio_id: str = None, no_cache: bool = False, file_path_for_cache: str = None, context=None):
+    async def process_transcription(self, audio_file_path: str, original_filename: str = None, audio_url: str = None, bvid: str = None, audio_id: str = None, no_cache: bool = False, file_path_for_cache: str = None, context=None, diarize: bool = False):
         """处理音频转录的主函数"""
         context = clamp_asr_context(context)  # 理论上限钳制（精确拟合由引擎守卫负责）
+        diarize_enabled = bool(diarize and config.diarization_enabled)
+        turns = None              # 分离结果（None = 未启用/降级/单人）
+        diarization_failed = False  # 区分「分离失败不写缓存」与「单人成功正常写缓存」
         timing = {
             "cache_check": 0.0,
             "model_load": 0.0,
@@ -579,25 +748,28 @@ class TranscriptionService:
             "cache_save": 0.0,
             "total": 0.0
         }
+        if diarize and not config.diarization_enabled:
+            logger.warning("收到 diarize=true 请求，但 diarization.enabled=false，按未启用处理")
+            timing["diarization"] = 0.0
         total_start = time.time()
 
         # 检查转录缓存（除非禁用缓存）
         cache_check_start = time.time()
         if not no_cache:
             if file_path_for_cache:
-                cached_result = cache_manager.get_cached_transcript(file_path=file_path_for_cache, context=context)
+                cached_result = cache_manager.get_cached_transcript(file_path=file_path_for_cache, context=context, diarize=diarize)
                 if cached_result:
                     cached_result.pop('cached_at', None)
                     logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
                     return cached_result
             elif audio_id and bvid:
-                cached_result = cache_manager.get_cached_transcript(None, bvid, audio_id, context=context)
+                cached_result = cache_manager.get_cached_transcript(None, bvid, audio_id, context=context, diarize=diarize)
                 if cached_result:
                     cached_result.pop('cached_at', None)
                     logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
                     return cached_result
             elif audio_url or bvid:
-                cached_result = cache_manager.get_cached_transcript(audio_url, bvid, context=context)
+                cached_result = cache_manager.get_cached_transcript(audio_url, bvid, context=context, diarize=diarize)
                 if cached_result:
                     cached_result.pop('cached_at', None)
                     logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
@@ -639,10 +811,53 @@ class TranscriptionService:
 
             logger.info(f"开始识别: {filename_to_log}")
 
-            # 3. 调用后端转录（在独立线程执行，避免阻塞事件循环）
+            # 3. 调用后端转录 + 可选说话人分离（并行，独立线程）
             transcription_start_time = time.time()
-            result = await asyncio.to_thread(backend.transcribe, audio_file_path, None, context)
-            processing_time = time.time() - transcription_start_time
+            if diarize_enabled:
+                diarize_timeout = _diarize_timeout(audio_duration)
+                diarize_start = time.time()
+
+                async def _diarize_job():
+                    t0 = time.time()
+                    try:
+                        turns = await asyncio.to_thread(_diarize_samples, audio_file_path)
+                        return turns, time.time() - t0
+                    except Exception:
+                        logger.warning("说话人分离失败，本次降级为无 speaker 输出（不写缓存）", exc_info=True)
+                        return None, time.time() - t0
+
+                asr_task = asyncio.create_task(
+                    asyncio.to_thread(backend.transcribe, audio_file_path, None, context))
+                diar_task = asyncio.create_task(
+                    asyncio.wait_for(_diarize_job(), timeout=diarize_timeout))
+                diar_elapsed = 0.0
+                try:
+                    result = await asr_task  # ASR 异常照旧冒泡给外层 except
+                except BaseException:
+                    # ASR 失败时回收分离任务，避免后台线程继续占用 GPU/推理锁
+                    diar_task.cancel()
+                    try:
+                        await diar_task
+                    except BaseException:
+                        pass
+                    raise
+                processing_time = time.time() - transcription_start_time  # ASR 耗时快照（语义不变）
+                try:
+                    turns, diar_elapsed = await diar_task
+                except asyncio.TimeoutError:
+                    diar_elapsed = time.time() - diarize_start
+                    logger.warning(f"说话人分离超时（>{diarize_timeout:.0f}s），降级且不写缓存")
+                    turns, diarization_failed = None, True
+                except Exception:
+                    diar_elapsed = time.time() - diarize_start
+                    logger.warning("说话人分离任务异常，降级且不写缓存", exc_info=True)
+                    turns, diarization_failed = None, True
+                if turns is None:
+                    diarization_failed = True  # job 内部异常降级同样标记
+                timing["diarization"] = diar_elapsed
+            else:
+                result = await asyncio.to_thread(backend.transcribe, audio_file_path, None, context)
+                processing_time = time.time() - transcription_start_time
             timing["transcription"] = processing_time
 
             # 刷新活跃时间
@@ -651,6 +866,11 @@ class TranscriptionService:
             transcript_text = result.text
             detected_lang = result.language
             timestamps = result.timestamps
+
+            # 单说话人退化：聚类仅 1 人视为未启用（分离成功，缓存照常写入）
+            if turns is not None and len({t.speaker for t in turns}) <= 1:
+                logger.info("说话人分离结果仅 1 人，按单人视频处理（不标注）")
+                turns = None
 
             # 优先使用后端计算的 RTF，否则本地计算
             if result.performance and result.performance.get("rtf"):
@@ -675,7 +895,9 @@ class TranscriptionService:
             # 4. 生成字幕格式
             subtitle_start = time.time()
             if timestamps:
-                subtitle_body = generate_subtitle_segments_from_timestamps(transcript_text, timestamps, detected_lang, audio_duration=audio_duration)
+                subtitle_body = generate_subtitle_segments_from_timestamps(
+                    transcript_text, timestamps, detected_lang,
+                    audio_duration=audio_duration, turns=turns)
             else:
                 subtitle_body = generate_subtitle_segments(transcript_text)
             timing["subtitle_generate"] = time.time() - subtitle_start
@@ -701,14 +923,20 @@ class TranscriptionService:
                 "status": "success"
             }
 
-            # 保存到缓存
+            # 说话人汇总（仅 speaker 模式输出时存在）
+            if subtitle_body and "speaker" in subtitle_body[0]:
+                response["speakers"] = _aggregate_speakers(subtitle_body)
+
+            # 保存到缓存（分离失败降级时跳过，下次请求重试分离）
             cache_save_start = time.time()
-            if file_path_for_cache:
-                cache_manager.save_transcript_to_cache(file_path=file_path_for_cache, transcript_data=response, context=context)
+            if diarization_failed:
+                logger.info("分离降级：本次结果不写入缓存（下次请求将重试分离）")
+            elif file_path_for_cache:
+                cache_manager.save_transcript_to_cache(file_path=file_path_for_cache, transcript_data=response, context=context, diarize=diarize)
             elif audio_id and bvid:
-                cache_manager.save_transcript_to_cache(None, response, bvid, audio_id, context=context)
+                cache_manager.save_transcript_to_cache(None, response, bvid, audio_id, context=context, diarize=diarize)
             elif audio_url or bvid:
-                cache_manager.save_transcript_to_cache(audio_url, response, bvid, context=context)
+                cache_manager.save_transcript_to_cache(audio_url, response, bvid, context=context, diarize=diarize)
             timing["cache_save"] = time.time() - cache_save_start
             response["timing"]["cache_save"] = round(timing["cache_save"], 3)
             response["timing"]["total"] = round(time.time() - total_start, 3)
