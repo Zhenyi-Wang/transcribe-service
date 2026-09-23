@@ -175,3 +175,38 @@ def test_aggregate_speakers_excludes_negative():
         {"id": 0, "duration": 2.0, "segments": 1},
         {"id": 1, "duration": 3.0, "segments": 1},
     ]
+
+
+def test_merge_split_absorbs_tiny_speaker_drift():
+    """句中短暂 speaker 漂移（2 字 1.0s）不拆分：整段保留，标重叠主导 speaker"""
+    text = "前面是一很长的话中途两个字漂移后面继续说完整个句子内容"  # 27 字无标点
+    spk_seq = [0] * 12 + [1] * 2 + [0] * 13  # 中间 2 字漂移
+    ts = _char_ts([(c, spk) for c, spk in zip(text, spk_seq)])
+    body = _merge_char_timestamps(text, ts)
+    assert len(body) == 1  # 漂移被吸收，不拆
+    assert body[0]["speaker"] == 0  # 主导 speaker
+    assert body[0]["content"] == text
+
+
+def test_merge_split_keeps_both_sides_when_large_enough():
+    """两侧都足够长（≥4 字且 ≥1s）的变化点仍然拆分"""
+    text = "甲说话说了很长的一段内容乙接话也非常长啊这对话真长啊"
+    spk_seq = [0] * 14 + [1] * 12
+    ts = _char_ts([(c, spk) for c, spk in zip(text, spk_seq)])
+    body = _merge_char_timestamps(text, ts)
+    assert len(body) == 2
+    assert body[0]["speaker"] == 0 and body[1]["speaker"] == 1
+
+
+def test_merge_split_no_zero_duration_segments():
+    """拆分子段内部时间全部塌缩（start==end）时补最小时长，杜绝零时长字幕"""
+    text = "甲说话说了很长的一段内容乙接话也非常长啊这对话真长啊"
+    spk_seq = [0] * 14 + [1] * 12
+    ts = _char_ts([(c, spk) for c, spk in zip(text, spk_seq)])
+    # 第二子段（项 14-25）时间全部塌缩到 7.0
+    for i in range(14, 26):
+        ts[i]["start"] = ts[i]["end"] = 7.0
+    body = _merge_char_timestamps(text, ts)
+    assert len(body) == 2
+    for seg in body:
+        assert seg["to"] > seg["from"], f"zero-duration segment: {seg}"

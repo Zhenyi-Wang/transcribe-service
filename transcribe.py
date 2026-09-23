@@ -384,15 +384,16 @@ def _strip_speaker(body: list) -> list:
 
 
 def _majority_speaker(intervals, w_start: float, w_end: float):
-    """[(start, end, speaker), ...] 中与 [w_start, w_end] 重叠最大者；全无 speaker 返回 None"""
-    best, best_ov = None, 0.0
+    """[(start, end, speaker), ...] 中与 [w_start, w_end] 重叠总面积最大的 speaker（按 speaker 聚合）；全无 speaker 返回 None"""
+    totals = {}
     for s, e, sp in intervals:
         if sp is None:
             continue
-        ov = min(w_end, e) - max(w_start, s)
-        if ov > best_ov:
-            best_ov, best = ov, sp
-    return best
+        ov = max(0.0, min(w_end, e) - max(w_start, s))
+        totals[sp] = totals.get(sp, 0.0) + ov
+    if not totals:
+        return None
+    return max(totals, key=totals.get)
 
 
 def _regroup_fragments_by_space(timestamps: list) -> list:
@@ -519,15 +520,78 @@ def _merge_char_timestamps(text: str, timestamps: list, audio_duration: float = 
             # speaker 模式：项带 speaker 键且段内存在变化 → 段内边界拆分。
             # 拆分不破坏全局对齐：各子段 clean 文本拼接 == 原 clean_seg，
             # 子段时间范围取各自首尾项，ts_offset 推进不变。
+            # 过短子段（<4 字且 <1s，即 diarization 边界噪声落在句中的漂移）
+            # 被吸收进相邻子段，避免把词从中间劈开产生 0.4s 碎字幕。
             range_speakers = [timestamps[i].get("speaker") for i in range(start_idx, end_idx + 1)]
             if any(sp is not None for sp in range_speakers) and len(set(range_speakers)) > 1:
-                # 组边界 = speaker 变化的项索引
                 cuts = [start_idx]
                 for k in range(1, len(range_speakers)):
                     if range_speakers[k] != range_speakers[k - 1]:
                         cuts.append(start_idx + k)
                 cuts.append(end_idx + 1)
+
+                # 吸收过短子段：迭代并入相邻较大子段，直至全部达标或仅剩一组
+                MIN_SUB_CHARS, MIN_SUB_DUR = 4, 1.0
+                groups = [[cuts[i], cuts[i + 1]] for i in range(len(cuts) - 1)]  # [start, end)
+
+                # 每个子段的主导 speaker（按项时长与子段区间重叠）
+                def _group_speaker(a, b):
+                    return _majority_speaker(
+                        [(timestamps[i].get("start", 0), timestamps[i].get("end", 0), range_speakers[i - start_idx])
+                         for i in range(a, b)],
+                        timestamps[a].get("start", 0), timestamps[b - 1].get("end", 0))
+
+                changed = True
+                while changed and len(groups) > 1:
+                    changed = False
+                    for gi, (a, b) in enumerate(groups):
+                        dur = timestamps[b - 1].get("end", 0) - timestamps[a].get("start", 0)
+                        if (b - a) < MIN_SUB_CHARS and dur < MIN_SUB_DUR:
+                            if gi == 0:
+                                groups[1][0] = a
+                            elif gi == len(groups) - 1:
+                                groups[gi - 1][1] = b
+                            else:
+                                left, right = groups[gi - 1], groups[gi + 1]
+                                if left[1] - left[0] >= right[1] - right[0]:
+                                    left[1] = b
+                                else:
+                                    right[0] = a
+                            groups.pop(gi)
+                            changed = True
+                            break
+
+                # 相邻子段主导 speaker 相同 → 合并（漂移吸收后两侧常同属一人）
+                gi = 0
+                while gi < len(groups) - 1:
+                    if _group_speaker(*groups[gi]) == _group_speaker(*groups[gi + 1]):
+                        groups[gi][1] = groups[gi + 1][1]
+                        groups.pop(gi + 1)
+                    else:
+                        gi += 1
+
+                if len(groups) == 1:
+                    # 全部吸收：整段输出，标主导 speaker
+                    spk = _group_speaker(groups[0][0], groups[0][1])
+                    seg_from = timestamps[start_idx].get("start", 0)
+                    seg_to = timestamps[end_idx].get("end", 0)
+                    if seg_to <= seg_from:
+                        seg_to = seg_from + 0.5
+                    body.append({
+                        "from": round(seg_from, 2),
+                        "to": round(seg_to, 2),
+                        "sid": len(body) + 1,
+                        "location": 2,
+                        "content": seg_text,
+                        "music": 0,
+                        "speaker": spk,
+                    })
+                    last_end_time = max(last_end_time, seg_to)
+                    last_speaker = spk
+                    continue
+
                 # 把 seg_text 按 clean 字符切分位置切成含标点子串（标点跟随前一个 clean 字符）
+                cuts = [groups[0][0]] + [g[1] for g in groups[:-1]] + [groups[-1][1]]
                 cut_clean_pos = {c - start_idx for c in cuts[1:-1]}
                 text_parts = []
                 buf, ci = [], 0
@@ -543,10 +607,14 @@ def _merge_char_timestamps(text: str, timestamps: list, audio_duration: float = 
 
                 for gi in range(len(cuts) - 1):
                     g_start, g_end = cuts[gi], cuts[gi + 1] - 1  # 项索引闭区间
-                    sub_speaker = range_speakers[g_start - start_idx]
+                    sub_speaker = _group_speaker(g_start, g_end + 1)
+                    seg_from = timestamps[g_start].get("start", 0)
+                    seg_to = timestamps[g_end].get("end", 0)
+                    if seg_to <= seg_from:
+                        seg_to = seg_from + 0.3  # 子段时间塌缩兜底，杜绝零时长字幕
                     body.append({
-                        "from": round(timestamps[g_start].get("start", 0), 2),
-                        "to": round(timestamps[g_end].get("end", 0), 2),
+                        "from": round(seg_from, 2),
+                        "to": round(seg_to, 2),
                         "sid": len(body) + 1,
                         "location": 2,
                         "content": text_parts[gi] if gi < len(text_parts) else "",
