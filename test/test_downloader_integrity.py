@@ -62,7 +62,7 @@ class TestDownloadAudioSizeCheck:
     def test_size_mismatch_fails_and_removes_file(self, video_dl, tmp_path):
         target = tmp_path / "a.m4s"
         chunks = [b"x" * 1000] * 5  # 实际 5000 字节
-        with patch("downloaders.bilibili_video.requests.get",
+        with patch("downloaders.bilibili_base.requests.get",
                    return_value=make_response(chunks, content_length=10000)):
             ok, detail = video_dl.download_audio("http://x", "ck", str(target))
         assert not ok
@@ -72,7 +72,7 @@ class TestDownloadAudioSizeCheck:
     def test_size_match_succeeds(self, video_dl, tmp_path):
         target = tmp_path / "a.m4s"
         chunks = [b"x" * 1000] * 5
-        with patch("downloaders.bilibili_video.requests.get",
+        with patch("downloaders.bilibili_base.requests.get",
                    return_value=make_response(chunks, content_length=5000)):
             ok, result = video_dl.download_audio("http://x", "ck", str(target))
         assert ok, result
@@ -82,14 +82,14 @@ class TestDownloadAudioSizeCheck:
         # 无 content-length 时此层不拦（兜底靠 ffprobe 时长校验）
         target = tmp_path / "a.m4s"
         chunks = [b"x" * 1000] * 3
-        with patch("downloaders.bilibili_video.requests.get",
+        with patch("downloaders.bilibili_base.requests.get",
                    return_value=make_response(chunks)):
             ok, result = video_dl.download_audio("http://x", "ck", str(target))
         assert ok, result
 
     def test_passes_timeout_to_requests(self, video_dl, tmp_path):
         target = tmp_path / "a.m4s"
-        with patch("downloaders.bilibili_video.requests.get",
+        with patch("downloaders.bilibili_base.requests.get",
                    return_value=make_response([b"x"], content_length=1)) as m:
             video_dl.download_audio("http://x", "ck", str(target))
         assert m.call_args.kwargs.get("timeout") is not None
@@ -98,7 +98,7 @@ class TestDownloadAudioSizeCheck:
         # 重复头会被 requests 合并为 "n, n"，应取首段而非崩溃
         target = tmp_path / "a.m4s"
         chunks = [b"x" * 1000] * 5
-        with patch("downloaders.bilibili_video.requests.get",
+        with patch("downloaders.bilibili_base.requests.get",
                    return_value=make_response(chunks, content_length="5000, 5000")):
             ok, result = video_dl.download_audio("http://x", "ck", str(target))
         assert ok, result
@@ -124,9 +124,9 @@ class TestVideoDownloadFlow:
             [(True, target)] * MAX_ATTEMPTS,
         )
         with p1, p2, p3 as dl_mock, \
-             patch("downloaders.bilibili_video.verify_audio_file",
+             patch("downloaders.bilibili_base.verify_audio_file",
                    side_effect=[(False, "时长不足"), (False, "时长不足"), (True, "ok")]), \
-             patch("downloaders.bilibili_video.cache_manager") as cache_mock, \
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock, \
              patch("os.remove"), patch("os.replace"):
             cache_mock.get_cached_file.return_value = None  # 无缓存，走下载
             ok, result = video_dl.download("BV1xx", "ck", save_dir=str(tmp_path))
@@ -143,9 +143,9 @@ class TestVideoDownloadFlow:
             [(True, target)] * MAX_ATTEMPTS,
         )
         with p1, p2, p3 as dl_mock, \
-             patch("downloaders.bilibili_video.verify_audio_file",
+             patch("downloaders.bilibili_base.verify_audio_file",
                    return_value=(False, "音频不完整: 实际时长 1.0s，期望 123.5s")), \
-             patch("downloaders.bilibili_video.cache_manager") as cache_mock, \
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock, \
              patch("os.remove"):
             cache_mock.get_cached_file.return_value = None
             ok, result = video_dl.download("BV1xx", "ck", save_dir=str(tmp_path))
@@ -162,9 +162,9 @@ class TestVideoDownloadFlow:
             results,
         )
         with p1, p2, p3 as dl_mock, \
-             patch("downloaders.bilibili_video.verify_audio_file",
+             patch("downloaders.bilibili_base.verify_audio_file",
                    return_value=(True, "ok")), \
-             patch("downloaders.bilibili_video.cache_manager") as cache_mock, \
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock, \
              patch("os.replace"):
             cache_mock.get_cached_file.return_value = None
             ok, result = video_dl.download("BV1xx", "ck", save_dir=str(tmp_path))
@@ -183,9 +183,9 @@ class TestVideoDownloadFlow:
             [(True, target)],
         )
         with p1, p2, p3 as dl_mock, \
-             patch("downloaders.bilibili_video.verify_audio_file",
+             patch("downloaders.bilibili_base.verify_audio_file",
                    side_effect=[(False, "时长不足"), (True, "ok")]), \
-             patch("downloaders.bilibili_video.cache_manager") as cache_mock, \
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock, \
              patch("os.replace"):
             cache_mock.get_cached_file.return_value = str(bad_cache)
             ok, result = video_dl.download("BV1xx", "ck", save_dir=str(tmp_path))
@@ -203,9 +203,9 @@ class TestVideoDownloadFlow:
             [(True, target)],
         )
         with p1, p2, p3, \
-             patch("downloaders.bilibili_video.verify_audio_file",
+             patch("downloaders.bilibili_base.verify_audio_file",
                    return_value=(True, "ok")), \
-             patch("downloaders.bilibili_video.cache_manager") as cache_mock, \
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock, \
              patch("os.replace") as replace_mock:
             cache_mock.get_cached_file.return_value = None
             ok, result = video_dl.download("BV1xx", "ck", save_dir=str(tmp_path))
@@ -223,8 +223,8 @@ class TestVideoDownloadFlow:
                               return_value=("http://audio.example/a.m4s", core)), \
                  patch.object(video_dl, "download_audio",
                               side_effect=lambda u, c, f, _pid=pid: captured.append((_pid, f)) or (False, "boom")), \
-                 patch("downloaders.bilibili_video.cache_manager") as cache_mock, \
-                 patch("downloaders.bilibili_video.os.getpid", return_value=pid):
+                 patch("downloaders.bilibili_base.cache_manager") as cache_mock, \
+                 patch("downloaders.bilibili_base.os.getpid", return_value=pid):
                 cache_mock.get_cached_file.return_value = None
                 video_dl.download("BV1xx", "ck", save_dir=str(tmp_path))
         assert len(captured) == MAX_ATTEMPTS * 2
@@ -241,10 +241,10 @@ class TestVideoDownloadFlow:
             [(True, target)] * MAX_ATTEMPTS,
         )
         with p1, p2, p3, \
-             patch("downloaders.bilibili_video.verify_audio_file",
+             patch("downloaders.bilibili_base.verify_audio_file",
                    return_value=(False, "音频不完整")), \
-             patch("downloaders.bilibili_video.cache_manager") as cache_mock, \
-             patch("downloaders.bilibili_video.os.remove") as rm_mock:
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock, \
+             patch("downloaders.bilibili_base.os.remove") as rm_mock:
             cache_mock.get_cached_file.return_value = None
             ok, result = video_dl.download("BV1xx", "ck", save_dir=str(tmp_path))
         assert not ok
@@ -258,7 +258,7 @@ class TestVideoDownloadFlow:
                                         "timelength": 123456}), \
              patch.object(video_dl, "get_audio_url", return_value=None) as url_mock, \
              patch.object(video_dl, "download_audio") as dl_mock, \
-             patch("downloaders.bilibili_video.cache_manager") as cache_mock:
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock:
             cache_mock.get_cached_file.return_value = None
             ok, result = video_dl.download("BV1xx", "ck", save_dir=str(tmp_path))
         assert not ok
@@ -286,9 +286,9 @@ class TestVideoDownloadFlow:
         )
         with p1, \
              patch.object(video_dl, "download_audio") as dl_mock, \
-             patch("downloaders.bilibili_video.verify_audio_file",
+             patch("downloaders.bilibili_base.verify_audio_file",
                    return_value=(True, "ok")), \
-             patch("downloaders.bilibili_video.cache_manager") as cache_mock:
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock:
             cache_mock.get_cached_file.return_value = str(good_cache)
             ok, result = video_dl.download("BV1xx", "ck", save_dir=str(tmp_path))
         assert ok
@@ -304,9 +304,9 @@ class TestVideoDownloadFlow:
             [],
         )
         with p1, \
-             patch("downloaders.bilibili_video.verify_audio_file",
+             patch("downloaders.bilibili_base.verify_audio_file",
                    return_value=(True, "ok")) as verify_mock, \
-             patch("downloaders.bilibili_video.cache_manager") as cache_mock:
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock:
             cache_mock.get_cached_file.return_value = str(good_cache)
             ok, _ = video_dl.download("BV1xx", "ck", save_dir=str(tmp_path))
         assert ok
@@ -319,7 +319,7 @@ class TestVideoTimelengthExtraction:
         resp = MagicMock()
         resp.text = VIDEO_HTML
         resp.raise_for_status = lambda: None
-        with patch("downloaders.bilibili_video.requests.get", return_value=resp):
+        with patch("downloaders.bilibili_base.requests.get", return_value=resp):
             result = video_dl.get_audio_url("BV1xx", "ck")
         url, info = result
         assert info["timelength"] == 123456
@@ -328,7 +328,7 @@ class TestVideoTimelengthExtraction:
         resp = MagicMock()
         resp.text = VIDEO_HTML
         resp.raise_for_status = lambda: None
-        with patch("downloaders.bilibili_video.requests.get", return_value=resp):
+        with patch("downloaders.bilibili_base.requests.get", return_value=resp):
             info = video_dl.get_audio_info("BV1xx", "ck")
         assert info["timelength"] == 123456
 
@@ -351,7 +351,7 @@ class TestTrialSegmentDetection:
         resp = MagicMock()
         resp.text = durl_html(706600, [29900])
         resp.raise_for_status = lambda: None
-        with patch("downloaders.bilibili_video.requests.get", return_value=resp):
+        with patch("downloaders.bilibili_base.requests.get", return_value=resp):
             with pytest.raises(TrialSegmentError):
                 video_dl.get_audio_url("BV1xx", "ck")
 
@@ -361,7 +361,7 @@ class TestTrialSegmentDetection:
         resp.text = ('<html><script>window.__playinfo__={"data":{"timelength":60000,'
                      '"durl":[{"order":1,"url":"http://seg0.mp4","size":1000}]}}</script></html>')
         resp.raise_for_status = lambda: None
-        with patch("downloaders.bilibili_video.requests.get", return_value=resp):
+        with patch("downloaders.bilibili_base.requests.get", return_value=resp):
             result = video_dl.get_audio_url("BV1xx", "ck")
         assert result is not None
 
@@ -370,7 +370,7 @@ class TestTrialSegmentDetection:
         resp = MagicMock()
         resp.text = durl_html(120000, [60000, 60000])
         resp.raise_for_status = lambda: None
-        with patch("downloaders.bilibili_video.requests.get", return_value=resp):
+        with patch("downloaders.bilibili_base.requests.get", return_value=resp):
             with pytest.raises(TrialSegmentError, match="多段"):
                 video_dl.get_audio_url("BV1xx", "ck")
 
@@ -379,7 +379,7 @@ class TestTrialSegmentDetection:
         resp = MagicMock()
         resp.text = durl_html(60000, [59900])
         resp.raise_for_status = lambda: None
-        with patch("downloaders.bilibili_video.requests.get", return_value=resp):
+        with patch("downloaders.bilibili_base.requests.get", return_value=resp):
             result = video_dl.get_audio_url("BV1xx", "ck")
         url, info = result
         assert url == "http://seg0.mp4"
@@ -396,7 +396,7 @@ class TestTrialSegmentDetection:
         with p1, \
              patch.object(video_dl, "get_audio_url", side_effect=raise_trial) as url_mock, \
              patch.object(video_dl, "download_audio") as dl_mock, \
-             patch("downloaders.bilibili_video.cache_manager") as cache_mock:
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock:
             cache_mock.get_cached_file.return_value = None
             ok, result = video_dl.download("BV1xx", "ck", save_dir=str(tmp_path))
         assert not ok
@@ -424,9 +424,9 @@ class TestEpisodeDownloadFlow:
             [(True, target)] * MAX_ATTEMPTS,
         )
         with p1, p2, p3 as dl_mock, \
-             patch("downloaders.bilibili_episode.verify_audio_file",
+             patch("downloaders.bilibili_base.verify_audio_file",
                    side_effect=[(False, "时长不足"), (False, "时长不足"), (True, "ok")]), \
-             patch("downloaders.bilibili_episode.cache_manager") as cache_mock, \
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock, \
              patch("os.replace"):
             cache_mock.get_cached_file.return_value = None  # 无缓存，走下载
             ok, result = episode_dl.download("2289525", "ck", save_dir=str(tmp_path))
@@ -445,9 +445,9 @@ class TestEpisodeDownloadFlow:
             [(True, target)],
         )
         with p1, p2, p3 as dl_mock, \
-             patch("downloaders.bilibili_episode.verify_audio_file",
+             patch("downloaders.bilibili_base.verify_audio_file",
                    side_effect=[(False, "时长不足"), (True, "ok")]), \
-             patch("downloaders.bilibili_episode.cache_manager") as cache_mock, \
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock, \
              patch("os.replace"):
             cache_mock.get_cached_file.return_value = str(bad_cache)
             ok, result = episode_dl.download("2289525", "ck", save_dir=str(tmp_path))
@@ -458,7 +458,7 @@ class TestEpisodeDownloadFlow:
     def test_size_mismatch_fails_and_removes_file(self, episode_dl, tmp_path):
         target = tmp_path / "b.m4s"
         chunks = [b"x" * 1000] * 5
-        with patch("downloaders.bilibili_episode.requests.get",
+        with patch("downloaders.bilibili_base.requests.get",
                    return_value=make_response(chunks, content_length=10000)):
             ok, detail = episode_dl.download_audio("http://x", "ck", str(target))
         assert not ok
@@ -475,9 +475,9 @@ class TestEpisodeDownloadFlow:
             [(True, target)] * MAX_ATTEMPTS,
         )
         with p1, p2, p3, \
-             patch("downloaders.bilibili_episode.verify_audio_file",
+             patch("downloaders.bilibili_base.verify_audio_file",
                    return_value=(False, "音频不完整: 实际时长 30.0s，期望 234.6s")), \
-             patch("downloaders.bilibili_episode.cache_manager") as cache_mock, \
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock, \
              patch("os.remove"):
             cache_mock.get_cached_file.return_value = None
             ok, result = episode_dl.download("2289525", "ck", save_dir=str(tmp_path))
@@ -494,7 +494,7 @@ class TestEpisodeDownloadFlow:
             [(False, "下载失败: 下载不完整: 已下载 5 字节，期望 100 字节")] * MAX_ATTEMPTS,
         )
         with p1, p2, p3, \
-             patch("downloaders.bilibili_episode.cache_manager") as cache_mock:
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock:
             cache_mock.get_cached_file.return_value = None
             ok, result = episode_dl.download("2289525", "ck", save_dir=str(tmp_path))
         assert not ok
@@ -510,10 +510,10 @@ class TestEpisodeDownloadFlow:
             [(True, target)] * MAX_ATTEMPTS,
         )
         with p1, p2, p3, \
-             patch("downloaders.bilibili_episode.verify_audio_file",
+             patch("downloaders.bilibili_base.verify_audio_file",
                    return_value=(False, "音频不完整")), \
-             patch("downloaders.bilibili_episode.cache_manager") as cache_mock, \
-             patch("downloaders.bilibili_episode.os.remove") as rm_mock:
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock, \
+             patch("downloaders.bilibili_base.os.remove") as rm_mock:
             cache_mock.get_cached_file.return_value = None
             ok, result = episode_dl.download("2289525", "ck", save_dir=str(tmp_path))
         assert not ok
@@ -527,7 +527,7 @@ class TestEpisodeDownloadFlow:
                                         "timelength": 234567}), \
              patch.object(episode_dl, "get_audio_url", return_value=None) as url_mock, \
              patch.object(episode_dl, "download_audio") as dl_mock, \
-             patch("downloaders.bilibili_episode.cache_manager") as cache_mock:
+             patch("downloaders.bilibili_base.cache_manager") as cache_mock:
             cache_mock.get_cached_file.return_value = None
             ok, result = episode_dl.download("2289525", "ck", save_dir=str(tmp_path))
         assert not ok
@@ -541,7 +541,7 @@ class TestEpisodeTimelengthExtraction:
         resp = MagicMock()
         resp.text = EPISODE_HTML
         resp.raise_for_status = lambda: None
-        with patch("downloaders.bilibili_episode.requests.get", return_value=resp):
+        with patch("downloaders.bilibili_base.requests.get", return_value=resp):
             result = episode_dl.get_audio_url("2289525", "ck")
         url, info = result
         assert info["timelength"] == 234567
