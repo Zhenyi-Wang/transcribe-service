@@ -4,7 +4,7 @@ import shutil
 import threading
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import config
 from downloaders import BilibiliDownloader
-from transcribe import TranscriptionService
+from transcribe import TranscriptionService, diarize_only, diarize_merge_subtitle
 from logger_config import setup_logger
 from cache_manager import cache_manager
 from pydantic import BaseModel
@@ -136,6 +136,8 @@ class BilibiliTranscribeRequest(BaseModel):
     page: int = 1
     context: Optional[str] = None  # ASR 偏置文本（标题/UP主/简介），可选
     diarize: bool = False  # 说话人分离（显式传入才启用）
+    diarize_only: bool = False  # 仅说话人分离（不跑 ASR，返回说话人时间轴）
+    body: Optional[List[dict]] = None  # diarize_only=true 时携带官方字幕 body → 分离+标注拼接模式
 
     class Config:
         populate_by_name = True
@@ -272,6 +274,13 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
         audio_url = result["audio_url"]  # 获取音频URL
         audio_id = result.get("audio_id")  # 获取音频ID（可选）
         logger.info(f"音频下载完成: {temp_filename}")
+
+        # 仅说话人分离：不进 ASR。携带 body → 分离+标注拼接模式（官方字幕场景），
+        # 否则返回说话人时间轴
+        if request.diarize_only:
+            if request.body:
+                return await diarize_merge_subtitle(request.body, temp_filename, request.bvid, download_time)
+            return await diarize_only(temp_filename, request.bvid, download_time)
 
         # 2. 使用转录服务处理
         # 使用更友好的文件名用于日志显示，page 信息编码到 bvid 中确保缓存键唯一

@@ -795,6 +795,104 @@ def _diarize_timeout(audio_duration: float) -> float:
     return max(60.0, audio_duration * 0.5)
 
 
+async def _diarize_turns_or_error(audio_file_path: str, video_id, download_time: float, total_start: float):
+    """仅分离公共执行体（不跑 ASR）：返回 (turns, error, timing)，成功时 error 为 None。
+
+    未启用/超时/失败时 turns 为 None 且 error 为 status=error 响应——
+    仅分离模式的调用方需要显式失败信号来决定是否拼接，不做静默降级。
+    """
+    timing = {"download": round(download_time, 3), "diarization": 0.0}
+
+    def _err(message: str) -> dict:
+        return {"status": "error", "message": message, "video_id": video_id,
+                "timing": {**timing, "total": round(time.time() - total_start, 3)}}
+
+    if not config.diarization_enabled:
+        logger.warning("收到仅分离请求，但 diarization.enabled=false")
+        return None, _err("diarization disabled"), timing
+
+    audio_duration = get_audio_duration(audio_file_path)
+    timeout = _diarize_timeout(audio_duration)
+    diarize_start = time.time()
+    try:
+        turns = await asyncio.wait_for(asyncio.to_thread(_diarize_samples, audio_file_path), timeout=timeout)
+    except asyncio.TimeoutError:
+        timing["diarization"] = time.time() - diarize_start
+        logger.warning(f"说话人分离超时（>{timeout:.0f}s）")
+        return None, _err("diarization timeout"), timing
+    except Exception as e:
+        timing["diarization"] = time.time() - diarize_start
+        logger.warning("说话人分离失败", exc_info=True)
+        return None, _err(f"diarization failed: {e}"), timing
+    timing["diarization"] = time.time() - diarize_start
+    return turns, None, timing
+
+
+def _turns_speaker_summary(turns: list) -> list:
+    """turns → 按说话人聚合的摘要（id 升序）"""
+    stat = {}
+    for t in turns:
+        d = stat.setdefault(t.speaker, {"id": t.speaker, "duration": 0.0, "turns": 0})
+        d["duration"] += t.end - t.start
+        d["turns"] += 1
+    return [{"id": d["id"], "duration": round(d["duration"], 1), "turns": d["turns"]}
+            for d in sorted(stat.values(), key=lambda x: x["id"])]
+
+
+async def diarize_only(audio_file_path: str, video_id: str = None, download_time: float = 0.0) -> dict:
+    """仅说话人分离（不跑 ASR）：返回说话人时间轴。
+
+    单人也原样返回 turns（是否采用由调用方判断）。
+    不涉及 ASR，不写转录缓存（音频下载缓存由下载层负责）。
+    """
+    total_start = time.time()
+    turns, error, timing = await _diarize_turns_or_error(audio_file_path, video_id, download_time, total_start)
+    if error:
+        return error
+
+    speakers = _turns_speaker_summary(turns)
+    logger.info(f"仅说话人分离完成: {video_id} {len(speakers)} 人 / {len(turns)} turns")
+    return {
+        "status": "success",
+        "video_id": video_id,
+        "turns": [{"speaker": t.speaker, "start": round(t.start, 3), "end": round(t.end, 3)} for t in turns],
+        "speakers": speakers,
+        "timing": {**timing, "total": round(time.time() - total_start, 3)},
+    }
+
+
+async def diarize_merge_subtitle(body: list, audio_file_path: str, video_id: str = None,
+                                 download_time: float = 0.0) -> dict:
+    """官方字幕说话人标注（不跑 ASR）：调用方（noteflow 自动字幕路径）把拉到的
+    官方字幕 body 发来，分离后按时间重叠回填 speaker 返回。
+
+    对齐复用 funasr 退化路径的 _posthoc_align_speakers（重叠 ≥ 段时长 50% 赋标签，
+    否则 -1 = 跨界段，分组输出中延续当前组）。单人返回 error——无需标注，
+    调用方保持原字幕。不写转录缓存。
+    """
+    total_start = time.time()
+    turns, error, timing = await _diarize_turns_or_error(audio_file_path, video_id, download_time, total_start)
+    if error:
+        return error
+
+    if len({t.speaker for t in turns}) <= 1:
+        logger.info("仅分离+字幕标注：分离结果仅 1 人，无需标注")
+        return {"status": "error", "message": "single speaker", "video_id": video_id,
+                "timing": {"download": round(download_time, 3),
+                           "total": round(time.time() - total_start, 3)}}
+
+    annotated = _posthoc_align_speakers(body, turns)
+    speakers = _aggregate_speakers(annotated)
+    logger.info(f"仅分离+字幕标注完成: {video_id} {len(speakers)} 人标注 {len(annotated)} 段")
+    return {
+        "status": "success",
+        "video_id": video_id,
+        "body": annotated,
+        "speakers": speakers,
+        "timing": {**timing, "total": round(time.time() - total_start, 3)},
+    }
+
+
 class TranscriptionService:
     """转录服务类，封装所有转录相关逻辑"""
 
