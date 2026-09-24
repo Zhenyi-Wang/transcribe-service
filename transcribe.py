@@ -867,8 +867,9 @@ async def diarize_merge_subtitle(body: list, audio_file_path: str, video_id: str
     官方字幕 body 发来，分离后按时间重叠回填 speaker 返回。
 
     对齐复用 funasr 退化路径的 _posthoc_align_speakers（重叠 ≥ 段时长 50% 赋标签，
-    否则 -1 = 跨界段，分组输出中延续当前组）。单人返回 error——无需标注，
-    调用方保持原字幕。不写转录缓存。
+    否则 -1 = 跨界段，分组输出中延续当前组）。单人是"成功识别但无需标注"：
+    status=success + annotated=false + body 原样返回；真正的失败（超时/异常/未启用）
+    仍为 error。不写转录缓存。
     """
     total_start = time.time()
     turns, error, timing = await _diarize_turns_or_error(audio_file_path, video_id, download_time, total_start)
@@ -877,9 +878,10 @@ async def diarize_merge_subtitle(body: list, audio_file_path: str, video_id: str
 
     if len({t.speaker for t in turns}) <= 1:
         logger.info("仅分离+字幕标注：分离结果仅 1 人，无需标注")
-        return {"status": "error", "message": "single speaker", "video_id": video_id,
-                "timing": {"download": round(download_time, 3),
-                           "total": round(time.time() - total_start, 3)}}
+        return {"status": "success", "video_id": video_id,
+                "body": body, "speakers": _turns_speaker_summary(turns),
+                "annotated": False, "reason": "single_speaker",
+                "timing": {**timing, "total": round(time.time() - total_start, 3)}}
 
     annotated = _posthoc_align_speakers(body, turns)
     speakers = _aggregate_speakers(annotated)
@@ -889,6 +891,8 @@ async def diarize_merge_subtitle(body: list, audio_file_path: str, video_id: str
         "video_id": video_id,
         "body": annotated,
         "speakers": speakers,
+        "annotated": True,
+        "reason": None,
         "timing": {**timing, "total": round(time.time() - total_start, 3)},
     }
 

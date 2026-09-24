@@ -43,19 +43,22 @@ noteflow 的「自动字幕」路径（B站官方字幕，`transcribeType: "auto
 
 ## 失败语义（区别于转录路径的静默降级——调用方需要显式失败信号决定是否拼接）
 
-| 场景 | 响应 message |
+| 场景 | 响应 |
 |---|---|
-| `diarization.enabled=false` | `diarization disabled` |
-| 分离超时（`max(60, duration×0.5)s`，同转录路径） | `diarization timeout` |
-| 管线异常 | `diarization failed: <原因>` |
-| 拼接模式下分离结果仅 1 人 | `single speaker`（无需标注，调用方保持原字幕） |
+| `diarization.enabled=false` | error，message `diarization disabled` |
+| 分离超时（`max(60, duration×0.5)s`，同转录路径） | error，message `diarization timeout` |
+| 管线异常 | error，message `diarization failed: <原因>` |
+
+拼接模式的成功响应带 `annotated: bool` 与 `reason`：**单人是"成功识别但无需标注"而非失败**——
+返回 `{"status": "success", "annotated": false, "reason": "single_speaker", "body": <原样>}`（与转录路径
+单人退化为无标注的语义对齐）；多说话人时 `annotated: true, reason: null`。
 
 - 不写转录缓存（没跑 ASR）；音频下载缓存照常生效，重跑只花推理时间
 - `page` 照常透传，多 P 视频字幕（对应 cid）与分离时间轴同页同轴
 
 ## 调用方（mryk24 noteflow）
 
-`extractors/bilibili.ts` 的 `diarizeSubtitle()`：官方字幕分支在 `funasr.diarize` 开启时，把 `fetchSubtitle` 得到的 body POST 给 `funasr.apiUrl`（共用 funasr 限流队列，超时 10 分钟），拿回标注 body 回写 `rawContent`；下游 clean/summarize 的【说话人N】分组与提示词注入全自动复用。失败/单人只记 warn 日志，任务照常出无标注字幕。
+`extractors/bilibili.ts` 的 `diarizeSubtitle()`：官方字幕分支在 `funasr.autoSubtitleDiarize` 开启时，把 `fetchSubtitle` 得到的 body POST 给 `funasr.apiUrl`（共用 funasr 限流队列，超时 10 分钟），按 `annotated` 回写标注 body 并记 info；error 才 warn 降级为无标注字幕。下游 clean/summarize 的【说话人N】分组与提示词注入全自动复用。
 
 ## 测试
 

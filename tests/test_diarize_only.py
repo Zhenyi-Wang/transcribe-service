@@ -142,6 +142,7 @@ async def test_merge_success_annotates_body(tmp_path, monkeypatch):
         {"id": 0, "duration": 5.5, "segments": 2},
         {"id": 1, "duration": 4.0, "segments": 1},
     ]
+    assert resp["annotated"] is True and resp["reason"] is None
 
 
 @pytest.mark.asyncio
@@ -160,16 +161,19 @@ async def test_merge_cross_boundary_segment_gets_minus_one(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_merge_single_speaker_returns_error(tmp_path, monkeypatch):
-    """单人：无需标注 → error（调用方保持原字幕，不产生单说话人分组）"""
+async def test_merge_single_speaker_success_unannotated(tmp_path, monkeypatch):
+    """单人 = 成功识别但无需标注：success + annotated=false + body 原样返回"""
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"")
     monkeypatch.setattr(T, "get_audio_duration", lambda p: 20.0)
     _enable_diarization(monkeypatch)
     with patch.object(T, "_diarize_samples", lambda path: [SpeakerTurn(0.0, 20.0, 0)]):
         resp = await T.diarize_merge_subtitle(SUBTITLE_BODY, str(wav))
-    assert resp["status"] == "error"
-    assert resp["message"] == "single speaker"
+    assert resp["status"] == "success"
+    assert resp["annotated"] is False
+    assert resp["reason"] == "single_speaker"
+    assert resp["body"] == SUBTITLE_BODY  # 原样，无 speaker 键
+    assert resp["speakers"] == [{"id": 0, "duration": 20.0, "turns": 1}]
 
 
 @pytest.mark.asyncio
