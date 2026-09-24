@@ -104,3 +104,4 @@ backend:
 ## 项目文档索引
 
 - [说话人识别集成可行性调查](docs/2026-09-23_speaker-diarization-feasibility.md) — 结论：可行；已实测（2026-09-23）：推荐「混合管线」pyannote GPU 分割 + wespeaker CN-Celeb 中文 ONNX embedding（RTF 0.027、显存 412MB、官方基准 4/4）；sherpa-onnx CPU 备选、sherpa GPU 实测更慢已排除；坑位：numpy 锁 1.26.4（2026-09-23）
+- [diarize_only 仅分离模式](docs/2026-09-24_diarize-only-endpoint.md) — /transcribe_url 的 diarize_only=true 分支：跳过 ASR 只返回说话人时间轴，供 noteflow 官方字幕拼接 speaker（2026-09-24）
