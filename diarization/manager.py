@@ -78,9 +78,34 @@ class DiarizationManager:
             turns.append(SpeakerTurn(start=start, end=end, speaker=label_to_id[label]))
         return turns
 
-    def diarize(self, samples: np.ndarray, sample_rate: int = 16000) -> List[SpeakerTurn]:
-        self._load()
+    @property
+    def is_loaded(self) -> bool:
+        return self._pipeline is not None
+
+    def unload(self) -> bool:
+        """卸载管线释放显存(服务暂停联动)。先等在跑的推理结束;未加载返回 False。
+
+        锁序 _infer_lock → _load_lock:与 diarize(_infer_lock 内 _load)一致,无死锁。
+        可在后台线程长时间等待(长视频推理分钟级)——调用方不得在请求线程同步调用。
+        """
         with self._infer_lock:
+            with self._load_lock:
+                if self._pipeline is None:
+                    return False
+                self._pipeline = None
+                import gc
+                import torch  # 延迟导入(模块 docstring 约定)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                logger.info("说话人分离管线已卸载")
+                return True
+
+    def diarize(self, samples: np.ndarray, sample_rate: int = 16000) -> List[SpeakerTurn]:
+        # _load 在 _infer_lock 内:加载→推理构成同一锁保护的完整生命周期,
+        # 与 unload(_infer_lock → _load_lock)无交错窗口
+        with self._infer_lock:
+            self._load()
             import torch
             waveform = torch.from_numpy(samples).unsqueeze(0)  # (1, T)
             audio = {"waveform": waveform, "sample_rate": sample_rate}
@@ -111,3 +136,19 @@ def get_manager() -> DiarizationManager:
                     hf_token=config.diarization_hf_token,
                 )
     return _manager
+
+
+def unload_global() -> bool:
+    """卸载单例管线并丢弃单例(下次 get_manager 按 config 重建)"""
+    global _manager
+    m = _manager
+    if m is None:
+        return False
+    released = m.unload()
+    with _manager_lock:
+        _manager = None
+    return released
+
+
+def is_loaded() -> bool:
+    return _manager is not None and _manager.is_loaded
