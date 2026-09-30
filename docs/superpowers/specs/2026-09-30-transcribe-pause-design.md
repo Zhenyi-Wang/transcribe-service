@@ -63,7 +63,7 @@ noteflow(挂起任务 deferred) <──兜底: 自身 setTimeout 到点唤醒─
 
 ### 3.3.1 asr-engine 暂停的上行传播(窄竞态窗口)
 
-已在途请求(过了 transcribe 暂停检查)转发到 asr-engine 时恰逢其暂停:`ASREngineClientBackend` 收到 503 + `{paused:true}` body 时**不再包成 RuntimeError**,而是抛专用 `UpstreamPausedError`;**`transcribe.py process_transcription` 的大 `except Exception`(现为 ~1116 行)与 `/transcribe_file` 端点外层 catch 遇 `UpstreamPausedError` 必须原样重抛,不得转成 200 的 `{status:"error"}` dict**(Python 侧的第五个包装点,漏掉则 noteflow 收到 200 error 烧重试,用例 9a 必失败);最终由 `server.py` 三个端点捕获并返回与中间件同格式的 `503 {paused, resume_at, detail}`(resume_at 取 transcribe 自己的暂停态,无则取 asr body 的)。noteflow 收到的仍是标准暂停 503 → 挂起,不烧重试。
+已在途请求(过了 transcribe 暂停检查)转发到 asr-engine 时恰逢其暂停:`ASREngineClientBackend` 收到 503 + `{paused:true}` body 时**不再包成 RuntimeError**,而是抛专用 `UpstreamPausedError`;**`transcribe.py process_transcription` 的大 `except Exception`(现为 ~1116 行)与 `/transcribe_file` 端点外层 catch 遇 `UpstreamPausedError` 必须原样重抛,不得转成 200 的 `{status:"error"}` dict**(Python 侧的第五个包装点,漏掉则 noteflow 收到 200 error 烧重试,用例 9a 必失败);最终由 `server.py` 三个端点捕获并返回与中间件同格式的 `503 {paused, resume_at, detail}`(优先取 UpstreamPausedError 携带的 asr body 值(asr 与 transcribe 暂停窗口同步,提前恢复后 transcribe 态已清空,asr body 的值才能正确支持 noteflow 迟到事件判定);缺失时回退当前时间)。noteflow 收到的仍是标准暂停 503 → 挂起,不烧重试。
 
 ### 3.4 恢复通知(主动推送)
 
