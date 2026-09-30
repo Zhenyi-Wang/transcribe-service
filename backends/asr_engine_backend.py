@@ -32,6 +32,15 @@ _LANG_MAP = {
 }
 
 
+class UpstreamPausedError(RuntimeError):
+    """asr-engine 暂停(503 + paused body)。需原样穿透到 server 端点转 503,不得转 error dict。"""
+
+    def __init__(self, message: str, resume_at: str = None, paused_at: str = None):
+        super().__init__(message)
+        self.resume_at = resume_at
+        self.paused_at = paused_at
+
+
 class ASREngineClientBackend(ASRBackend):
     def __init__(self, config, timeout: float = 3600.0):
         # 与其它 backend 一致接收 config（工厂 create() 用 backend_class(config) 统一构造，零特殊分支）。
@@ -93,6 +102,17 @@ class ASREngineClientBackend(ASRBackend):
             except httpx.ReadTimeout as e:
                 raise RuntimeError(f"asr-engine 转录超时 ({self._timeout}s): {e}") from e
             except httpx.HTTPStatusError as e:
+                if e.response.status_code == 503:
+                    # asr-engine 暂停信号（扁平 body：paused/resume_at/paused_at 顶层），
+                    # 原样穿透到 server 端点转 503 paused，不得转 RuntimeError error dict
+                    try:
+                        body = e.response.json()
+                    except Exception:
+                        body = {}
+                    if isinstance(body, dict) and body.get("paused") is True:
+                        raise UpstreamPausedError(
+                            body.get("detail") or "ASR 引擎暂停中",
+                            resume_at=body.get("resume_at"), paused_at=body.get("paused_at"))
                 raise RuntimeError(
                     f"asr-engine 返回 {e.response.status_code}: {e.response.text[:200]}"
                 ) from e

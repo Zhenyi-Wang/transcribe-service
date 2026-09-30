@@ -6,6 +6,7 @@ from pathlib import Path
 from config import config
 from logger_config import setup_logger
 from cache_manager import cache_manager
+from backends.asr_engine_backend import UpstreamPausedError
 
 logger = setup_logger(__name__)
 
@@ -1112,6 +1113,9 @@ class TranscriptionService:
             response["timing"]["total"] = round(time.time() - total_start, 3)
 
             return response
+
+        except UpstreamPausedError:
+            raise  # 暂停信号原样上抛,由端点转 503;不得转 error dict
 
         except Exception as e:
             if "out of memory" in str(e).lower():

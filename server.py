@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import config
 from downloaders import BilibiliDownloader
 from transcribe import TranscriptionService, diarize_only, diarize_merge_subtitle
+from backends.asr_engine_backend import UpstreamPausedError
 from logger_config import setup_logger
 from cache_manager import cache_manager
 from pydantic import BaseModel
@@ -233,6 +234,13 @@ async def transcribe_audio(file: UploadFile = File(...), diarize: bool = Form(Fa
         result = await transcription_service.process_transcription(str(temp_filename), file.filename, diarize=diarize)
 
         return result
+    except UpstreamPausedError as e:
+        from datetime import datetime as _dt
+        resume_iso = e.resume_at or _dt.now().astimezone().isoformat()
+        paused_iso = e.paused_at or _dt.now().astimezone().isoformat()
+        return JSONResponse(status_code=503, content={
+            "detail": "服务暂停中,稍后自动恢复", "paused": True,
+            "resume_at": resume_iso, "paused_at": paused_iso})
     finally:
         # 确保清理临时文件
         try:
@@ -293,6 +301,14 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
             result["timing"]["download"] = round(download_time, 3)
 
         return result
+
+    except UpstreamPausedError as e:
+        from datetime import datetime as _dt
+        resume_iso = e.resume_at or _dt.now().astimezone().isoformat()
+        paused_iso = e.paused_at or _dt.now().astimezone().isoformat()
+        return JSONResponse(status_code=503, content={
+            "detail": "服务暂停中,稍后自动恢复", "paused": True,
+            "resume_at": resume_iso, "paused_at": paused_iso})
 
     finally:
         # 确保清理临时文件（只清理tmp目录下的文件，不清理cache目录）
@@ -377,6 +393,8 @@ async def transcribe_webdav_file(request: WebdavTranscribeRequest):
 
         return result
 
+    except UpstreamPausedError:
+        raise  # 暂停信号穿透到统一包装转 503,不得被 except Exception 转 error dict
     except Exception as e:
         logger.error(f"网盘文件转录失败: {e}")
         return {
