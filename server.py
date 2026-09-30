@@ -146,28 +146,63 @@ def _fmt_resume_at(resume_at):
     return f"{resume_at:%H:%M}" if resume_at.date() == datetime.now().date() else f"{resume_at:%m-%d %H:%M}"
 
 
-def _paused_503_response():
-    resume_at = pause_manager.resume_at()
-    if resume_at is None:  # 窄 TOCTOU:检查与构造之间被 /resume
-        resume_at = datetime.now()
-    retry_after = max(1, math.ceil(pause_manager.remaining_seconds()))
-    paused_at = pause_manager.paused_at()
+def _parse_iso_dt(value):
+    """ISO 时间字符串 → aware datetime(缺时区按本地补);空/非法返回 None"""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return dt.astimezone() if dt.tzinfo is None else dt
+
+
+def _paused_503_response(resume_at=None, paused_at=None):
+    """暂停 503 统一构造器(中间件拦截与三端点 UpstreamPausedError 分支共用,响应体四键扁平)。
+
+    resume_at/paused_at 优先取 UpstreamPausedError 携带的 asr body 值(端点路径传入)——
+    asr 与 transcribe 暂停窗口同步,提前恢复后 transcribe 态已清空,asr body 的值才能
+    正确支持 noteflow 迟到事件判定;缺失回退 transcribe 自身暂停态,仍缺失则 resume_at
+    取当前时间(窄 TOCTOU:检查与构造之间被 /resume)、paused_at 置 None。
+    Retry-After 按 transcribe 自身暂停态剩余秒数估算;无暂停态则按 resume_at 与当前
+    时间差;仍不可得(已过期/非法)则省略该 header,不误导客户端等待一个过期时刻。
+    """
+    resume_dt = _parse_iso_dt(resume_at)
+    if resume_dt is None:
+        resume_dt = pause_manager.resume_at()
+    paused_dt = _parse_iso_dt(paused_at)
+    if paused_dt is None:
+        paused_dt = pause_manager.paused_at()
+    now = datetime.now().astimezone()
+    if resume_dt is None:  # 窄 TOCTOU:检查与构造之间被 /resume
+        resume_dt = now
+    headers = {}
+    remaining = pause_manager.remaining_seconds()
+    if remaining > 0:  # transcribe 自身暂停态优先
+        headers["Retry-After"] = str(max(1, math.ceil(remaining)))
+    elif resume_dt > now:  # 走到此分支时 resume_dt 必为异常携带值(aware),不会混入本地 naive
+        headers["Retry-After"] = str(max(1, math.ceil((resume_dt - now).total_seconds())))
     return JSONResponse(
         status_code=503,
-        content={"detail": f"服务暂停中，预计 {_fmt_resume_at(resume_at)} 恢复",
+        content={"detail": f"服务暂停中，预计 {_fmt_resume_at(resume_dt)} 恢复",
                  "paused": True,
-                 "resume_at": resume_at.astimezone().isoformat(),
-                 "paused_at": paused_at.astimezone().isoformat() if paused_at else None},
-        headers={"Retry-After": str(retry_after)})
+                 "resume_at": resume_dt.astimezone().isoformat(),
+                 "paused_at": paused_dt.astimezone().isoformat() if paused_dt else None},
+        headers=headers or None)
 
 
 def _pause_asr_engine(hours: float) -> str:
-    """转发暂停到 asr-engine；容错(其 idle 卸载兜底)"""
+    """转发暂停到 asr-engine；容错(其 idle 卸载兜底)。校验业务码:200 且 ok=true 才算 paused"""
     import httpx
     try:
         resp = httpx.post(f"{config.asr_engine_url.rstrip('/')}/admin/pause",
                           json={"hours": hours}, timeout=5.0)
-        return "paused" if resp.status_code == 200 else f"http_{resp.status_code}"
+        if resp.status_code != 200:
+            return f"http_{resp.status_code}"
+        body = resp.json()  # 解析失败/非 dict 异常落入下方 except → "failed"
+        if body.get("ok") is True:
+            return "paused"
+        return f"rejected_{body}"  # 200 但业务码拒绝(如暂停被上游校验驳回)
     except Exception as e:
         logger.warning(f"转发暂停到 asr-engine 失败(容错): {e}")
         return "failed"
@@ -202,9 +237,10 @@ def _release_gpu_for_pause(gen: int) -> dict:
             logger.warning(f"暂停卸载 backend 失败: {e}")
             result["backend"] = "failed"
     if pause_manager.generation != gen:
-        return result  # 等锁期间已 resume，中止
+        return result  # 等锁期间已 resume，中止(双检之一;等锁后的二次校验在 unload_global 锁内)
     try:
-        result["diarization"] = "released" if diarization_mgr.unload_global() else "not_loaded"
+        result["diarization"] = ("released" if diarization_mgr.unload_global(
+            should_abort=lambda: pause_manager.generation != gen) else "not_loaded")
     except Exception as e:
         logger.warning(f"暂停卸载 diarization 失败: {e}")
         result["diarization"] = "failed"
@@ -332,12 +368,7 @@ async def transcribe_audio(file: UploadFile = File(...), diarize: bool = Form(Fa
 
         return result
     except UpstreamPausedError as e:
-        from datetime import datetime as _dt
-        resume_iso = e.resume_at or _dt.now().astimezone().isoformat()
-        paused_iso = e.paused_at or _dt.now().astimezone().isoformat()
-        return JSONResponse(status_code=503, content={
-            "detail": "服务暂停中,稍后自动恢复", "paused": True,
-            "resume_at": resume_iso, "paused_at": paused_iso})
+        return _paused_503_response(resume_at=e.resume_at, paused_at=e.paused_at)
     finally:
         # 确保清理临时文件
         try:
@@ -400,12 +431,7 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
         return result
 
     except UpstreamPausedError as e:
-        from datetime import datetime as _dt
-        resume_iso = e.resume_at or _dt.now().astimezone().isoformat()
-        paused_iso = e.paused_at or _dt.now().astimezone().isoformat()
-        return JSONResponse(status_code=503, content={
-            "detail": "服务暂停中,稍后自动恢复", "paused": True,
-            "resume_at": resume_iso, "paused_at": paused_iso})
+        return _paused_503_response(resume_at=e.resume_at, paused_at=e.paused_at)
 
     finally:
         # 确保清理临时文件（只清理tmp目录下的文件，不清理cache目录）
@@ -504,12 +530,7 @@ async def transcribe_webdav_file(request: WebdavTranscribeRequest):
                 "rtf": 0.0
             }
     except UpstreamPausedError as e:
-        from datetime import datetime as _dt
-        resume_iso = e.resume_at or _dt.now().astimezone().isoformat()
-        paused_iso = e.paused_at or _dt.now().astimezone().isoformat()
-        return JSONResponse(status_code=503, content={
-            "detail": "服务暂停中,稍后自动恢复", "paused": True,
-            "resume_at": resume_iso, "paused_at": paused_iso})
+        return _paused_503_response(resume_at=e.resume_at, paused_at=e.paused_at)
 
 
 class PauseRequest(BaseModel):

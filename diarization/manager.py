@@ -82,13 +82,19 @@ class DiarizationManager:
     def is_loaded(self) -> bool:
         return self._pipeline is not None
 
-    def unload(self) -> bool:
+    def unload(self, should_abort=None) -> bool:
         """卸载管线释放显存(服务暂停联动)。先等在跑的推理结束;未加载返回 False。
+
+        should_abort: 中止回调(Callable[[], bool]),在获取 _infer_lock 之后、检查/清空
+        _pipeline 之前调用——等锁期间世代可能已变(如等待长推理时用户 /resume),
+        返回 True 即提前中止,防"恢复后又被旧释放链卸载"。
 
         锁序 _infer_lock → _load_lock:与 diarize(_infer_lock 内 _load)一致,无死锁。
         可在后台线程长时间等待(长视频推理分钟级)——调用方不得在请求线程同步调用。
         """
         with self._infer_lock:
+            if should_abort is not None and should_abort():
+                return False  # 等锁期间世代已变,提前中止(管线保持原状)
             with self._load_lock:
                 if self._pipeline is None:
                     return False
@@ -138,13 +144,19 @@ def get_manager() -> DiarizationManager:
     return _manager
 
 
-def unload_global() -> bool:
-    """卸载单例管线并丢弃单例(下次 get_manager 按 config 重建)"""
+def unload_global(should_abort=None) -> bool:
+    """卸载单例管线并丢弃单例(下次 get_manager 按 config 重建);should_abort 透传给 unload。
+
+    中止(世代已变)时管线仍在 → 保留单例供后续推理直接复用,/status 的
+    diarization_loaded 保持如实;其余情形(正常卸载/本就未加载)照旧丢弃单例。
+    """
     global _manager
     m = _manager
     if m is None:
         return False
-    released = m.unload()
+    released = m.unload(should_abort=should_abort)
+    if not released and m.is_loaded:
+        return False  # 等锁期间被中止,管线未动,单例保留
     with _manager_lock:
         _manager = None
     return released

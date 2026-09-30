@@ -111,13 +111,14 @@ class PauseManager:
     def pause(self, hours: float) -> datetime:
         now = time.time()
         with self._lock:
-            self._paused_until = now + hours * 3600
+            until = now + hours * 3600
+            self._paused_until = until
             self._paused_at = now
             self._unload_attempted = False
             self._generation += 1
             self._write_state()
         self._schedule_notify()
-        return datetime.fromtimestamp(self._paused_until)
+        return datetime.fromtimestamp(until)  # 锁内快照,避免与并发 pause/resume 竞态读到旧值
 
     def resume(self) -> bool:
         with self._lock:
