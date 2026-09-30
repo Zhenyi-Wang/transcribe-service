@@ -145,3 +145,6 @@ cache/*
 
 .claude/
 lib.bak-*/
+
+# 暂停状态文件(运行时产物)
+pause_state.json
