@@ -27,6 +27,13 @@ def test_expired_and_corrupted_state(tmp_path):
     assert not PauseManager(state_file=f).is_paused() and not f.exists()
 
 
+def test_missing_paused_at_state_is_corrupted(tmp_path):
+    f = tmp_path / "p.json"
+    f.write_text(json.dumps({"paused_until": "2099-01-01T00:00:00"}), encoding="utf-8")
+    assert not PauseManager(state_file=f).is_paused()
+    assert not f.exists()
+
+
 def test_pause_overrides_and_lazy_expiry(tmp_path):
     pm = PauseManager(state_file=tmp_path / "p.json")
     pm.pause(1)
@@ -52,7 +59,7 @@ def test_notify_scheduled_and_fired(tmp_path):
     assert fired == [1]      # 到点通知已触发(到期即发,不做 is_paused 检查)
     pm.pause(0.0001)
     pm.resume()              # resume 立即通知并清定时
-    time.sleep(0.3)
+    time.sleep(0.4)
     assert len(fired) == 2
 
 

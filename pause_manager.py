@@ -38,6 +38,7 @@ class PauseManager:
         try:
             data = json.loads(self._state_file.read_text(encoding="utf-8"))
             until = datetime.fromisoformat(data["paused_until"]).timestamp()
+            paused_at = datetime.fromisoformat(data.get("paused_at")).timestamp()
         except Exception as e:
             logger.warning(f"暂停状态文件损坏,视为未暂停: {self._state_file} ({e})")
             self._try_unlink(); return
@@ -45,10 +46,7 @@ class PauseManager:
             logger.info("已过期的暂停状态文件,删除并视为未暂停")
             self._try_unlink(); return
         self._paused_until = until
-        try:
-            self._paused_at = datetime.fromisoformat(data["paused_at"]).timestamp()
-        except Exception:
-            self._paused_at = None
+        self._paused_at = paused_at
         logger.info(f"恢复暂停状态: 至 {self.resume_at():%Y-%m-%d %H:%M:%S}")
         self._schedule_notify()  # 重启后按剩余时长重设通知
 
@@ -90,15 +88,16 @@ class PauseManager:
 
     def _schedule_notify(self):
         """按剩余时长设一次性通知定时(覆盖旧定时)"""
-        if self._notify_timer is not None:
-            self._notify_timer.cancel()
-            self._notify_timer = None
-        if not self.is_paused() or self._notify_fn is None:
-            return
-        delay = max(0.1, self.remaining_seconds())
-        self._notify_timer = threading.Timer(delay, self._fire_notify)
-        self._notify_timer.daemon = True
-        self._notify_timer.start()
+        with self._lock:
+            if self._notify_timer is not None:
+                self._notify_timer.cancel()
+                self._notify_timer = None
+            if not self.is_paused() or self._notify_fn is None:
+                return
+            delay = max(0.1, self.remaining_seconds())
+            self._notify_timer = threading.Timer(delay, self._fire_notify)
+            self._notify_timer.daemon = True
+            self._notify_timer.start()
 
     def _fire_notify(self):
         # 到点即发,不检查 is_paused():定时到点时暂停必然已到期(is_paused=False),
@@ -128,9 +127,9 @@ class PauseManager:
             self._unload_attempted = False
             self._generation += 1
             self._try_unlink()
-        if self._notify_timer is not None:
-            self._notify_timer.cancel()
-            self._notify_timer = None
+            if self._notify_timer is not None:
+                self._notify_timer.cancel()
+                self._notify_timer = None
         if was_paused and self._notify_fn is not None:
             threading.Thread(target=self._notify_fn, daemon=True).start()  # 立即通知,不阻塞响应
         if was_paused:
@@ -138,20 +137,28 @@ class PauseManager:
         return was_paused
 
     def is_paused(self) -> bool:
-        return self._paused_until is not None and time.time() < self._paused_until
+        until = self._paused_until
+        return until is not None and time.time() < until
 
     def resume_at(self):
-        if not self.is_paused():
+        until = self._paused_until
+        if until is None or time.time() >= until:
             return None
-        return datetime.fromtimestamp(self._paused_until)
+        return datetime.fromtimestamp(until)
 
     def paused_at(self):
-        if not self.is_paused() or self._paused_at is None:
+        until = self._paused_until
+        paused_at = self._paused_at
+        if until is None or paused_at is None or time.time() >= until:
             return None
-        return datetime.fromtimestamp(self._paused_at)
+        return datetime.fromtimestamp(paused_at)
 
     def remaining_seconds(self) -> float:
-        return self._paused_until - time.time() if self.is_paused() else 0.0
+        until = self._paused_until
+        if until is None:
+            return 0.0
+        remaining = until - time.time()
+        return remaining if remaining > 0 else 0.0
 
     def status(self) -> dict:
         resume_at = self.resume_at()
