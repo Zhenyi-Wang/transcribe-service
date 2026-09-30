@@ -208,6 +208,22 @@ class Config:
         """API访问令牌"""
         return self.get('api.token', "")
 
+    # ========== 暂停配置 ==========
+    @property
+    def pause_config(self) -> dict:
+        """暂停功能配置组"""
+        return self.get('pause', {})
+
+    @property
+    def pause_notify_url(self) -> str:
+        """恢复通知端点（noteflow 唤醒；空 = 不发通知）"""
+        return self.pause_config.get('notify_url', '')
+
+    @property
+    def pause_notify_token(self) -> str:
+        """恢复通知令牌"""
+        return self.pause_config.get('notify_token', '')
+
     # ========== 缓存配置 ==========
     @property
     def cache_enabled(self) -> bool:

@@ -1,8 +1,11 @@
 import os
 import time
+import math
+import asyncio
 import shutil
 import threading
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -17,7 +20,9 @@ from transcribe import TranscriptionService, diarize_only, diarize_merge_subtitl
 from backends.asr_engine_backend import UpstreamPausedError
 from logger_config import setup_logger
 from cache_manager import cache_manager
-from pydantic import BaseModel
+from pause_manager import PauseManager, MAX_PAUSE_HOURS
+from diarization import manager as diarization_mgr
+from pydantic import BaseModel, Field
 
 # 设置 HuggingFace 缓存目录和日志
 os.environ['HF_HOME'] = str(Path.home() / ".cache/huggingface")
@@ -129,6 +134,83 @@ manager = ModelManager()
 downloader = BilibiliDownloader()
 transcription_service = TranscriptionService(manager)
 
+# ================= 暂停管理单例 =================
+pause_manager = PauseManager(notify_url=config.pause_notify_url,
+                             notify_token=config.pause_notify_token)
+PAUSED_REJECT_PATHS = {"/transcribe", "/transcribe_url", "/transcribe_file"}
+
+
+def _fmt_resume_at(resume_at):
+    if resume_at is None:
+        return "未知"
+    return f"{resume_at:%H:%M}" if resume_at.date() == datetime.now().date() else f"{resume_at:%m-%d %H:%M}"
+
+
+def _paused_503_response():
+    resume_at = pause_manager.resume_at()
+    if resume_at is None:  # 窄 TOCTOU:检查与构造之间被 /resume
+        resume_at = datetime.now()
+    retry_after = max(1, math.ceil(pause_manager.remaining_seconds()))
+    paused_at = pause_manager.paused_at()
+    return JSONResponse(
+        status_code=503,
+        content={"detail": f"服务暂停中，预计 {_fmt_resume_at(resume_at)} 恢复",
+                 "paused": True,
+                 "resume_at": resume_at.astimezone().isoformat(),
+                 "paused_at": paused_at.astimezone().isoformat() if paused_at else None},
+        headers={"Retry-After": str(retry_after)})
+
+
+def _pause_asr_engine(hours: float) -> str:
+    """转发暂停到 asr-engine；容错(其 idle 卸载兜底)"""
+    import httpx
+    try:
+        resp = httpx.post(f"{config.asr_engine_url.rstrip('/')}/admin/pause",
+                          json={"hours": hours}, timeout=5.0)
+        return "paused" if resp.status_code == 200 else f"http_{resp.status_code}"
+    except Exception as e:
+        logger.warning(f"转发暂停到 asr-engine 失败(容错): {e}")
+        return "failed"
+
+
+def _resume_asr_engine() -> str:
+    """转发恢复到 asr-engine(手动提前恢复必须同步，否则 asr 挂到原期限)；容错"""
+    import httpx
+    try:
+        resp = httpx.post(f"{config.asr_engine_url.rstrip('/')}/admin/resume", timeout=5.0)
+        return "resumed" if resp.status_code == 200 else f"http_{resp.status_code}"
+    except Exception as e:
+        logger.warning(f"转发恢复到 asr-engine 失败(容错，其到点自恢复兜底): {e}")
+        return "failed"
+
+
+def _release_gpu_for_pause(gen: int) -> dict:
+    """后台释放链(仅本地卸载)：世代令牌防交错；绝不在请求线程同步调用(会等推理锁)。
+
+    asr-engine 的暂停转发不在此链中——/pause 端点同步调用 _pause_asr_engine(快速 HTTP)，
+    不受本地 in_use/推理锁阻塞，也不会因等锁延迟或延长上游暂停窗口。
+    """
+    result = {"backend": "not_loaded", "diarization": "not_loaded"}
+    if not pause_manager.is_paused():
+        return {"skipped": "resumed"}
+    pause_manager.mark_unload_attempted()
+    if manager._backend is not None and not manager.in_use:
+        try:
+            manager.unload_model()
+            result["backend"] = "released"
+        except Exception as e:
+            logger.warning(f"暂停卸载 backend 失败: {e}")
+            result["backend"] = "failed"
+    if pause_manager.generation != gen:
+        return result  # 等锁期间已 resume，中止
+    try:
+        result["diarization"] = "released" if diarization_mgr.unload_global() else "not_loaded"
+    except Exception as e:
+        logger.warning(f"暂停卸载 diarization 失败: {e}")
+        result["diarization"] = "failed"
+    logger.info(f"暂停本地释放链完成: {result}")
+    return result
+
 # 定义请求模型
 class BilibiliTranscribeRequest(BaseModel):
     bvid: str
@@ -157,9 +239,16 @@ class WebdavTranscribeRequest(BaseModel):
 def monitor_loop():
     while True:
         time.sleep(config.check_interval)
-        if manager._backend is not None and not manager.in_use:
-            if time.time() - manager.last_active_time > config.idle_timeout:
-                manager.unload_model()
+        try:
+            if pause_manager.should_unload():
+                # 补做本地卸载(等 diarization 推理锁属排空语义)；asr 转发已在 /pause 同步完成
+                _release_gpu_for_pause(pause_manager.generation)
+            elif (not pause_manager.is_paused() and manager._backend is not None
+                  and not manager.in_use):
+                if time.time() - manager.last_active_time > config.idle_timeout:
+                    manager.unload_model()
+        except Exception as e:
+            logger.warning(f"monitor_loop 异常(忽略继续): {e}")
 
 bg_thread = threading.Thread(target=monitor_loop, daemon=True)
 bg_thread.start()
@@ -173,6 +262,9 @@ async def startup_event():
     """应用启动时的事件处理"""
     logger.info("服务启动中...")
     cache_manager.cleanup_expired_cache()
+    if pause_manager.is_paused():
+        logger.info(f"启动时处于暂停状态(至 {_fmt_resume_at(pause_manager.resume_at())})，跳过预加载")
+        return
     logger.info("预加载模型...")
     try:
         manager.load_model_if_needed()
@@ -214,6 +306,11 @@ async def token_validation_middleware(request: Request, call_next):
                 content={"detail": "Invalid token"},
                 headers={"WWW-Authenticate": "Bearer"}
             )
+
+    # 暂停拦截(token 校验通过后、处理前；鉴权优先于 503)
+    if (request.url.path in PAUSED_REJECT_PATHS and request.method == "POST"
+            and pause_manager.is_paused()):
+        return _paused_503_response()
 
     # 继续处理请求
     response = await call_next(request)
@@ -414,18 +511,71 @@ async def transcribe_webdav_file(request: WebdavTranscribeRequest):
             "detail": "服务暂停中,稍后自动恢复", "paused": True,
             "resume_at": resume_iso, "paused_at": paused_iso})
 
+
+class PauseRequest(BaseModel):
+    hours: float = Field(gt=0, le=MAX_PAUSE_HOURS, description="暂停时长（小时，支持小数）")
+
+
+@app.post("/pause")
+async def pause_service(request: PauseRequest):
+    """暂停 N 小时：立即拒新请求；同步转发 asr 暂停(快速 HTTP)；本地释放链后台执行"""
+    resume_at = pause_manager.pause(request.hours)  # generation 在此 +1
+    gen = pause_manager.generation                  # 捕获新世代供释放链校验
+    logger.info(f"服务暂停 {request.hours}h，至 {_fmt_resume_at(resume_at)}")
+    asr_status = await asyncio.to_thread(_pause_asr_engine, request.hours)
+    asyncio.get_running_loop().run_in_executor(None, _release_gpu_for_pause, gen)
+    return {"paused": True,
+            "resume_at": resume_at.astimezone().isoformat(),
+            "resume_at_display": _fmt_resume_at(resume_at),
+            "hours": request.hours,
+            "asr_engine": asr_status,
+            "local_release": "background(在途任务跑完后完成，通常 ≤90s，长视频说话人分离可能更久；最终状态可查 /status)"}
+
+
+@app.post("/resume")
+async def resume_service():
+    """提前恢复：清暂停态+世代自增使旧释放链中止+转发 asr-engine 恢复+立即通知 noteflow 唤醒"""
+    was_paused = pause_manager.resume()
+    asr_status = await asyncio.to_thread(_resume_asr_engine) if was_paused else "not_paused"
+    logger.info(f"收到恢复请求(此前{'处于' if was_paused else '不在'}暂停状态，asr: {asr_status})")
+    return {"paused": False, "was_paused": was_paused, "asr_engine": asr_status}
+
+
+def _query_asr_paused() -> bool:
+    """查询 asr-engine 暂停态；不可达时报告 False(其进程不在=未暂停)"""
+    try:
+        import httpx
+        return httpx.get(f"{config.asr_engine_url.rstrip('/')}/health", timeout=3.0).json().get("paused", False)
+    except Exception as e:
+        logger.warning(f"查询 asr-engine 暂停态失败(视为未暂停): {e}")
+        return False
+
+
+@app.get("/status")
+async def service_status():
+    return {**pause_manager.status(),
+            "backend": manager.backend,
+            "model_loaded": manager._backend is not None,
+            "in_use": manager.in_use,
+            "diarization_loaded": diarization_mgr.is_loaded(),
+            "asr_engine_paused": await asyncio.to_thread(_query_asr_paused)}
+
+
 if __name__ == "__main__":
     import uvicorn
 
     # 预加载模型，避免第一次请求延迟
     logger.info("启动时预加载模型...")
     logger.info("注意：第一次运行时仍需要从 HuggingFace 下载模型，请耐心等待...")
-    try:
-        manager.load_model_if_needed()
-        logger.info("预加载完成，服务器已就绪！")
-    except Exception as e:
-        logger.warning(f"警告：预加载失败 - {e}")
-        logger.info("服务器将继续启动，将在首次请求时重试加载模型")
+    if pause_manager.is_paused():
+        logger.info(f"启动时处于暂停状态(至 {_fmt_resume_at(pause_manager.resume_at())})，跳过预加载")
+    else:
+        try:
+            manager.load_model_if_needed()
+            logger.info("预加载完成，服务器已就绪！")
+        except Exception as e:
+            logger.warning(f"警告：预加载失败 - {e}")
+            logger.info("服务器将继续启动，将在首次请求时重试加载模型")
 
     # 从配置获取API配置
     api_config = config.api_config

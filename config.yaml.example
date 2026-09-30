@@ -60,6 +60,11 @@ api:
 webdav:
   base_path: "/mnt/webdav"  # webdav挂载路径
 
+# 暂停配置（POST /pause 暂停服务时使用）
+pause:
+  notify_url: ""            # noteflow 唤醒端点，生产填 https://<mryk域名>/api/noteflow/internal/transcribe-wake
+  notify_token: ""          # 与 mryk24 NUXT_NOTEFLOW_INTERNAL_TOKEN 同值
+
 # 说话人分离（可选，diarize=true 请求参数触发）
 diarization:
   enabled: false
