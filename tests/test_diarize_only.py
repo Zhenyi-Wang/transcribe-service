@@ -34,7 +34,7 @@ async def test_success_returns_turns_and_speakers(tmp_path, monkeypatch):
     ]
     assert resp["timing"]["download"] == 1.5
     assert resp["timing"]["diarization"] >= 0.0
-    assert resp["timing"]["total"] >= resp["timing"]["diarization"]
+    assert resp["timing"]["total"] >= round(resp["timing"]["diarization"], 3)
 
 
 @pytest.mark.asyncio
