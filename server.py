@@ -378,33 +378,41 @@ async def transcribe_webdav_file(request: WebdavTranscribeRequest):
         }
 
     try:
-        # 使用转录服务处理，传入完整文件路径作为标识用于缓存
-        result = await transcription_service.process_transcription(
-            full_file_path,
-            request.path,  # 使用原始相对路径作为显示名
-            audio_url=None,
-            bvid=None,
-            audio_id=None,
-            no_cache=request.no_cache,
-            file_path_for_cache=full_file_path,  # 传入完整路径用于缓存
-            context=request.context,
-            diarize=request.diarize
-        )
+        try:
+            # 使用转录服务处理，传入完整文件路径作为标识用于缓存
+            result = await transcription_service.process_transcription(
+                full_file_path,
+                request.path,  # 使用原始相对路径作为显示名
+                audio_url=None,
+                bvid=None,
+                audio_id=None,
+                no_cache=request.no_cache,
+                file_path_for_cache=full_file_path,  # 传入完整路径用于缓存
+                context=request.context,
+                diarize=request.diarize
+            )
 
-        return result
+            return result
 
-    except UpstreamPausedError:
-        raise  # 暂停信号穿透到统一包装转 503,不得被 except Exception 转 error dict
-    except Exception as e:
-        logger.error(f"网盘文件转录失败: {e}")
-        return {
-            "status": "error",
-            "message": str(e),
-            "type": config.subtitle_config["type"],
-            "version": config.subtitle_config["version"],
-            "body": [],
-            "rtf": 0.0
-        }
+        except UpstreamPausedError:
+            raise  # 暂停信号穿透到统一包装转 503,不得被 except Exception 转 error dict
+        except Exception as e:
+            logger.error(f"网盘文件转录失败: {e}")
+            return {
+                "status": "error",
+                "message": str(e),
+                "type": config.subtitle_config["type"],
+                "version": config.subtitle_config["version"],
+                "body": [],
+                "rtf": 0.0
+            }
+    except UpstreamPausedError as e:
+        from datetime import datetime as _dt
+        resume_iso = e.resume_at or _dt.now().astimezone().isoformat()
+        paused_iso = e.paused_at or _dt.now().astimezone().isoformat()
+        return JSONResponse(status_code=503, content={
+            "detail": "服务暂停中,稍后自动恢复", "paused": True,
+            "resume_at": resume_iso, "paused_at": paused_iso})
 
 if __name__ == "__main__":
     import uvicorn
