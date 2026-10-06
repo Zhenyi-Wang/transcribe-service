@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import config
 from downloaders import BilibiliDownloader
+from downloaders import DouyinDownloader
 from transcribe import TranscriptionService, diarize_only, diarize_merge_subtitle
 from backends.asr_engine_backend import UpstreamPausedError
 from logger_config import setup_logger
@@ -132,12 +133,13 @@ def cleanup_stale_tmp_files(max_age_hours: int = 24):
 
 manager = ModelManager()
 downloader = BilibiliDownloader()
+downloader_douyin = DouyinDownloader()
 transcription_service = TranscriptionService(manager)
 
 # ================= 暂停管理单例 =================
 pause_manager = PauseManager(notify_url=config.pause_notify_url,
                              notify_token=config.pause_notify_token)
-PAUSED_REJECT_PATHS = {"/transcribe", "/transcribe_url", "/transcribe_file"}
+PAUSED_REJECT_PATHS = {"/transcribe", "/transcribe_url", "/transcribe_file", "/transcribe_douyin"}
 
 
 def _fmt_resume_at(resume_at):
@@ -270,6 +272,13 @@ class WebdavTranscribeRequest(BaseModel):
 
     class Config:
         populate_by_name = True
+
+
+class DouyinTranscribeRequest(BaseModel):
+    aweme_id: str = Field(..., pattern=r"^\d{15,20}$")  # 19位数字ID，字符串防精度丢失
+    no_cache: bool = False
+    context: Optional[str] = None  # ASR 偏置文本（标题/作者），可选
+    diarize: bool = False
 
 # ================= 后台保活线程 =================
 def monitor_loop():
@@ -531,6 +540,54 @@ async def transcribe_webdav_file(request: WebdavTranscribeRequest):
             }
     except UpstreamPausedError as e:
         return _paused_503_response(resume_at=e.resume_at, paused_at=e.paused_at)
+
+
+@app.post("/transcribe_douyin")
+async def transcribe_douyin_audio(request: DouyinTranscribeRequest):
+    """转录抖音视频音频接口（下载+ffmpeg提音频在本服务侧完成）"""
+    temp_filename = None
+    try:
+        logger.info(f"开始下载抖音音频: aweme_id={request.aweme_id}")
+        download_start = time.time()
+        success, result = downloader_douyin.download_douyin_audio(
+            request.aweme_id, save_dir=str(get_temp_dir()))
+        download_time = time.time() - download_start
+
+        if not success:
+            return {
+                "status": "error",
+                "message": f"音频下载失败: {result}",
+                "type": config.subtitle_config["type"],
+                "version": config.subtitle_config["version"],
+                "body": [],
+                "rtf": 0.0,
+                "timing": {"download": round(download_time, 3)},
+            }
+
+        temp_filename = result["file_path"]
+        audio_url = result["audio_url"]
+        display_name = f"Douyin_{request.aweme_id}"
+        result_out = await transcription_service.process_transcription(
+            temp_filename, display_name, audio_url,
+            request.aweme_id,  # bvid 位作转录缓存键
+            result.get("audio_id"), request.no_cache,
+            context=request.context, diarize=request.diarize)
+        if "timing" in result_out:
+            result_out["timing"]["download"] = round(download_time, 3)
+        return result_out
+
+    except UpstreamPausedError as e:
+        return _paused_503_response(resume_at=e.resume_at, paused_at=e.paused_at)
+    finally:
+        if temp_filename and os.path.exists(temp_filename):
+            if temp_filename.startswith("tmp/") or "/tmp/" in temp_filename:
+                try:
+                    os.remove(temp_filename)
+                except Exception as e:
+                    logger.warning(f"临时文件删除失败: {temp_filename}: {e}")
+            else:
+                logger.info(f"缓存文件保留: {temp_filename}")
+        cleanup_stale_tmp_files()
 
 
 class PauseRequest(BaseModel):

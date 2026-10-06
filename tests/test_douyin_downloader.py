@@ -117,5 +117,89 @@ class TestDownloadDouyinAudio(unittest.TestCase):
         self.assertFalse(ok)
 
 
+    @patch("downloaders.douyin.cache_manager")
+    @patch("downloaders.douyin.verify_audio_file", return_value=(True, "ok"))
+    @patch("downloaders.douyin.subprocess.run")
+    @patch("downloaders.douyin.DouyinDownloader.fetch_aweme_detail")
+    def test_retry_reparses_play_url_and_removes_failed_partial_file(
+            self, mock_detail, mock_run, mock_verify, mock_cache):
+        import tempfile, os
+        first_detail = _detail()
+        second_detail = _detail()
+        second_detail["video"]["play_addr"]["url_list"] = ["https://cdn/new-video"]
+        for bitrate in second_detail["video"]["bit_rate"]:
+            bitrate["play_addr"]["url_list"] = ["https://cdn/new-video"]
+        mock_detail.side_effect = [first_detail, second_detail]
+        mock_cache.get_cached_file.return_value = None
+        mock_cache.save_to_cache.side_effect = lambda url, file_path, *a, **kw: file_path
+        partial_paths = []
+
+        def _run(cmd, **kw):
+            out = cmd[cmd.index("-y") + 1]
+            partial_paths.append(out)
+            if mock_run.call_count == 1:
+                with open(out, "wb") as f:
+                    f.write(b"partial")
+                return MagicMock(returncode=1, stderr=b"failed")
+            with open(out, "wb") as f:
+                f.write(b"fake-m4a")
+            return MagicMock(returncode=0, stderr=b"")
+
+        mock_run.side_effect = _run
+        with tempfile.TemporaryDirectory() as td:
+            ok, result = DouyinDownloader().download_douyin_audio("7376234567890123456", save_dir=td)
+            self.assertTrue(ok)
+            self.assertEqual(mock_detail.call_count, 2)
+            self.assertEqual(result["audio_url"], "https://cdn/new-video")
+            self.assertFalse(os.path.exists(partial_paths[0]))
+
+    @patch("downloaders.douyin.cache_manager")
+    @patch("downloaders.douyin.verify_audio_file", return_value=(True, "ok"))
+    @patch("downloaders.douyin.subprocess.run")
+    @patch("downloaders.douyin.DouyinDownloader.fetch_aweme_detail")
+    def test_cached_file_returns_cached_url_without_ffmpeg(
+            self, mock_detail, mock_run, mock_verify, mock_cache):
+        import tempfile, os
+        mock_detail.return_value = _detail()
+        with tempfile.TemporaryDirectory() as td:
+            cached_file = os.path.join(td, "cached.m4a")
+            with open(cached_file, "wb") as f:
+                f.write(b"cached-audio")
+            mock_cache.get_cached_file.return_value = cached_file
+            ok, result = DouyinDownloader().download_douyin_audio("7376234567890123456", save_dir=td)
+
+        self.assertTrue(ok)
+        self.assertEqual(result["audio_url"], "cached://7376234567890123456")
+        mock_run.assert_not_called()
+
+    @patch("downloaders.douyin.cache_manager")
+    @patch("downloaders.douyin.verify_audio_file", return_value=(True, "ok"))
+    @patch("downloaders.douyin.subprocess.run")
+    @patch("downloaders.douyin.DouyinDownloader.fetch_aweme_detail")
+    def test_timeout_removes_partial_file(self, mock_detail, mock_run, mock_verify, mock_cache):
+        import tempfile, os, subprocess
+        mock_detail.side_effect = [_detail(), _detail()]
+        mock_cache.get_cached_file.return_value = None
+        mock_cache.save_to_cache.side_effect = lambda url, file_path, *a, **kw: file_path
+        partial_paths = []
+
+        def _run(cmd, **kw):
+            out = cmd[cmd.index("-y") + 1]
+            partial_paths.append(out)
+            if mock_run.call_count == 1:
+                with open(out, "wb") as f:
+                    f.write(b"partial")
+                raise subprocess.TimeoutExpired(cmd, timeout=kw["timeout"])
+            with open(out, "wb") as f:
+                f.write(b"fake-m4a")
+            return MagicMock(returncode=0, stderr=b"")
+
+        mock_run.side_effect = _run
+        with tempfile.TemporaryDirectory() as td:
+            ok, _ = DouyinDownloader().download_douyin_audio("7376234567890123456", save_dir=td)
+            self.assertTrue(ok)
+            self.assertFalse(os.path.exists(partial_paths[0]))
+
+
 if __name__ == "__main__":
     unittest.main()

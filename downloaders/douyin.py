@@ -122,11 +122,19 @@ class DouyinDownloader:
             except subprocess.TimeoutExpired:
                 last_error = f"ffmpeg 超时（>{FFMPEG_TIMEOUT_SEC}s）"
                 logger.warning(f"第 {attempt}/{MAX_DOWNLOAD_ATTEMPTS} 次{last_error}")
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
                 continue
             if proc.returncode != 0 or not os.path.exists(part_path):
                 stderr_tail = (proc.stderr or b"")[-500:].decode("utf-8", "ignore")
                 last_error = f"ffmpeg 提取音频失败: {stderr_tail}"
                 logger.warning(f"第 {attempt}/{MAX_DOWNLOAD_ATTEMPTS} 次{last_error}")
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
                 continue
 
             ok, detail_msg = verify_audio_file(part_path, expected_duration_ms=duration_ms or None)
