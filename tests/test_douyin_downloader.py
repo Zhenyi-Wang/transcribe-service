@@ -54,6 +54,15 @@ class TestFetchAwemeDetail(unittest.TestCase):
         mock_get.return_value = empty
         self.assertIsNone(DouyinDownloader().fetch_aweme_detail("123"))
 
+    @patch("downloaders.douyin.requests.get")
+    def test_all_network_errors_raise_runtime_error(self, mock_get):
+        """两趟均网络异常 → RuntimeError（瞬时故障），不折叠成"视频未找到"的 None"""
+        mock_get.side_effect = Exception("connection refused")
+        with self.assertRaises(RuntimeError) as ctx:
+            DouyinDownloader().fetch_aweme_detail("123")
+        self.assertIn("slidesinfo 查询失败", str(ctx.exception))
+        self.assertEqual(mock_get.call_count, 2)  # 两趟都试过
+
 
 class TestSelectPlayUrl(unittest.TestCase):
     def test_lowest_bitrate_selected(self):

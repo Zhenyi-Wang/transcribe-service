@@ -549,7 +549,9 @@ async def transcribe_douyin_audio(request: DouyinTranscribeRequest):
     try:
         logger.info(f"开始下载抖音音频: aweme_id={request.aweme_id}")
         download_start = time.time()
-        success, result = downloader_douyin.download_douyin_audio(
+        # 同步阻塞下载（ffmpeg 拉流最长 20 分钟）移入线程池，避免卡死事件循环（/pause、/status 全停摆）
+        success, result = await asyncio.to_thread(
+            downloader_douyin.download_douyin_audio,
             request.aweme_id, save_dir=str(get_temp_dir()))
         download_time = time.time() - download_start
 

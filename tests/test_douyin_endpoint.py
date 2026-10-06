@@ -2,7 +2,6 @@
 构造模式对齐 tests/test_upstream_paused.py：TestClient(server.app)（不用 with 块，
 与现有测试一致）、monkeypatch 拦截下载与转录、Bearer 头按 config.api_token。
 """
-import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import AsyncMock
 

@@ -34,11 +34,15 @@ class DouyinDownloader:
     """抖音视频（aweme_id）音频下载器"""
 
     def fetch_aweme_detail(self, aweme_id: str) -> Optional[dict]:
-        """查询 slidesinfo 返回 aweme 详情 dict；未找到返回 None。
+        """查询 slidesinfo 返回 aweme 详情 dict；确认无此视频（删除/私密）返回 None。
 
+        两趟请求全部因网络/HTTP/JSON 异常失败时抛 RuntimeError（瞬时故障，
+        向上冒泡由端点转 500，客户端走重试），与"确认无此视频"区分。
         图集内容首次查询可能为空，带 request_source=200 重试一次。
         """
         headers = {"User-Agent": DOUYIN_MOBILE_UA}  # 绝不带 Referer
+        last_error: Optional[Exception] = None
+        got_response = False
         for request_source in (None, 200):
             url = f"{SLIDESINFO_URL}?aweme_ids=%5B{aweme_id}%5D"  # 裸数字数组（["id"] 带引号会返回 null，2026-10-06 实测）
             if request_source is not None:
@@ -49,12 +53,16 @@ class DouyinDownloader:
                 data = resp.json()
             except Exception as e:
                 logger.warning(f"slidesinfo 请求失败(request_source={request_source}): {e}")
+                last_error = e
                 continue
+            got_response = True
             details = data.get("aweme_details") or []
             if details:
                 return details[0]
             logger.info(f"slidesinfo 空结果(request_source={request_source}), filter: "
                         f"{data.get('filter_list')}")
+        if not got_response:
+            raise RuntimeError(f"slidesinfo 查询失败: {last_error}")
         return None
 
     def _select_play_url(self, detail: dict) -> Optional[dict]:
