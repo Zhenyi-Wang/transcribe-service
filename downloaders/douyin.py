@@ -40,7 +40,7 @@ class DouyinDownloader:
         """
         headers = {"User-Agent": DOUYIN_MOBILE_UA}  # 绝不带 Referer
         for request_source in (None, 200):
-            url = f"{SLIDESINFO_URL}?aweme_ids=%5B%22{aweme_id}%22%5D"
+            url = f"{SLIDESINFO_URL}?aweme_ids=%5B{aweme_id}%5D"  # 裸数字数组（["id"] 带引号会返回 null，2026-10-06 实测）
             if request_source is not None:
                 url += f"&request_source={request_source}"
             try:

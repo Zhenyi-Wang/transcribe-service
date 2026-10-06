@@ -30,8 +30,8 @@ class TestFetchAwemeDetail(unittest.TestCase):
         self.assertEqual(d["desc"], "测试视频标题")
         # 请求参数：aweme_ids 数组、移动 UA、无 Referer
         args, kwargs = mock_get.call_args
-        self.assertIn("aweme_ids=%5B%227376234567890123456%22%5D", args[0]
-                      )  # requests 自动编码 [\"id\"]
+        self.assertIn("aweme_ids=%5B7376234567890123456%5D", args[0]
+                      )  # 裸数字数组（实测带引号返回 null）
         self.assertNotIn("Referer", kwargs["headers"])
         self.assertIn("iPhone", kwargs["headers"]["User-Agent"])
 
