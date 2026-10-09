@@ -107,3 +107,4 @@ backend:
 - [diarize_only 仅分离模式](docs/2026-09-24_diarize-only-endpoint.md) — /transcribe_url 的 diarize_only=true 分支：跳过 ASR 只返回说话人时间轴，供 noteflow 官方字幕拼接 speaker（2026-09-24）
 - [暂停端点与 GPU 释放链](docs/2026-09-30_pause-endpoint.md) — /pause /resume /status + 时间权威唯一(transcribe 落盘/推送)+ asr 层暂停语义 + noteflow deferred 挂起(零 DDL,不烧重试)+ 桌面 bat;关键坑:迟到 503 判 paused_at、wakeDeferredTasks 防 auto-import 歧义、5 处错误透传点(2026-09-30)
 - [GGUF 悬空指针崩溃根因与修复](docs/2026-10-09_gguf悬空指针崩溃根因与修复.md) — get_one_batch token 数组被 GC 后 llama_decode 读悬空指针→概率性 get_rows 越界 abort(长音频~80%必崩)；keepalive 修复(commit 4454335)；含排查复盘(两次错误假设)、diarize 超长假死缓解、官方 mtmd 路线挂起的触发条件(2026-10-09)
+- [diarization ONNX Conv Fallback 警告与提速](docs/2026-10-09_diarization-onnx-conv-fallback.md) — pyannote 3.3.2 硬编码 cudnn_conv_algo_search=DEFAULT，cuDNN 9.8+Turing 下全部 Conv 回退慢速核(embedding 慢 3~10 倍+每 Conv×每新形状刷警告)；_load() 期间 monkey-patch InferenceSession 剥掉该选项，零警告且最快(2026-10-09)
