@@ -106,3 +106,4 @@ backend:
 - [说话人识别集成可行性调查](docs/2026-09-23_speaker-diarization-feasibility.md) — 结论：可行；已实测（2026-09-23）：推荐「混合管线」pyannote GPU 分割 + wespeaker CN-Celeb 中文 ONNX embedding（RTF 0.027、显存 412MB、官方基准 4/4）；sherpa-onnx CPU 备选、sherpa GPU 实测更慢已排除；坑位：numpy 锁 1.26.4（2026-09-23）
 - [diarize_only 仅分离模式](docs/2026-09-24_diarize-only-endpoint.md) — /transcribe_url 的 diarize_only=true 分支：跳过 ASR 只返回说话人时间轴，供 noteflow 官方字幕拼接 speaker（2026-09-24）
 - [暂停端点与 GPU 释放链](docs/2026-09-30_pause-endpoint.md) — /pause /resume /status + 时间权威唯一(transcribe 落盘/推送)+ asr 层暂停语义 + noteflow deferred 挂起(零 DDL,不烧重试)+ 桌面 bat;关键坑:迟到 503 判 paused_at、wakeDeferredTasks 防 auto-import 歧义、5 处错误透传点(2026-09-30)
+- [GGUF 悬空指针崩溃根因与修复](docs/2026-10-09_gguf悬空指针崩溃根因与修复.md) — get_one_batch token 数组被 GC 后 llama_decode 读悬空指针→概率性 get_rows 越界 abort(长音频~80%必崩)；keepalive 修复(commit 4454335)；含排查复盘(两次错误假设)、diarize 超长假死缓解、官方 mtmd 路线挂起的触发条件(2026-10-09)
