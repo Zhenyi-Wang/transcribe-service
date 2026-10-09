@@ -6,6 +6,7 @@
 import logging
 import os
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import List
 
@@ -14,6 +15,40 @@ import numpy as np
 from config import config
 
 logger = logging.getLogger("diarization")
+
+
+@contextmanager
+def _strip_cudnn_conv_algo_search_default():
+    """建 ONNX 会话期间剥掉 CUDA EP 的 cudnn_conv_algo_search="DEFAULT"。
+
+    pyannote 3.3.2 为 wespeaker embedding 硬编码该选项（speaker_verification.py），
+    在本机 cuDNN 9.8 + Turing 上 cuDNN 找不到可用卷积算法，全部 Conv 回退 ORT
+    内置慢速核：单 batch 200~430ms（正常 42ms），且每个 Conv × 每个新输入形状
+    刷一条 Fallback mode 警告（一次请求 70+ 条）。剥掉后走 ORT 默认策略，
+    实测零警告且最快。仅匹配 CUDAExecutionProvider 且值为 DEFAULT 的会话，
+    其余会话原样透传（GGUF encoder 等不受影响）。
+    """
+    import onnxruntime as ort  # 延迟导入（模块 docstring 约定）
+    original = ort.InferenceSession
+
+    def patched(path_or_bytes, sess_options=None, providers=None, **kwargs):
+        if isinstance(providers, list):
+            stripped = []
+            for p in providers:
+                if (isinstance(p, tuple) and len(p) == 2 and p[0] == "CUDAExecutionProvider"
+                        and isinstance(p[1], dict) and p[1].get("cudnn_conv_algo_search") == "DEFAULT"):
+                    opts = {k: v for k, v in p[1].items() if k != "cudnn_conv_algo_search"}
+                    stripped.append(("CUDAExecutionProvider", opts) if opts else "CUDAExecutionProvider")
+                else:
+                    stripped.append(p)
+            providers = stripped
+        return original(path_or_bytes, sess_options=sess_options, providers=providers, **kwargs)
+
+    ort.InferenceSession = patched
+    try:
+        yield
+    finally:
+        ort.InferenceSession = original
 
 
 @dataclass
@@ -51,20 +86,22 @@ class DiarizationManager:
             import torch
             from pyannote.audio.pipelines.speaker_diarization import SpeakerDiarization
 
-            pipeline = SpeakerDiarization(
-                segmentation="pyannote/segmentation-3.0",
-                embedding=os.path.expanduser(self.embedding_model),  # 本地 ONNX（~ 展开）→ ONNXWeSpeakerPretrainedSpeakerEmbedding
-                clustering="AgglomerativeClustering",
-                segmentation_batch_size=32,
-                embedding_batch_size=32,
-            )
-            pipeline.instantiate({
-                "segmentation": {"min_duration_off": 0.0},
-                "clustering": {"method": "centroid",
-                               "threshold": self.cluster_threshold,
-                               "min_cluster_size": self.min_cluster_size},
-            })
-            pipeline.to(torch.device("cuda"))
+            # 建会话期间剥掉 pyannote 硬编码的 cudnn_conv_algo_search=DEFAULT（见 contextmanager docstring）
+            with _strip_cudnn_conv_algo_search_default():
+                pipeline = SpeakerDiarization(
+                    segmentation="pyannote/segmentation-3.0",
+                    embedding=os.path.expanduser(self.embedding_model),  # 本地 ONNX（~ 展开）→ ONNXWeSpeakerPretrainedSpeakerEmbedding
+                    clustering="AgglomerativeClustering",
+                    segmentation_batch_size=32,
+                    embedding_batch_size=32,
+                )
+                pipeline.instantiate({
+                    "segmentation": {"min_duration_off": 0.0},
+                    "clustering": {"method": "centroid",
+                                   "threshold": self.cluster_threshold,
+                                   "min_cluster_size": self.min_cluster_size},
+                })
+                pipeline.to(torch.device("cuda"))
             self._pipeline = pipeline
             logger.info("说话人分离管线加载完成（pyannote-hybrid, cuda）")
 
