@@ -683,7 +683,13 @@ def get_one_batch(token_id: int):
     它不依赖 llama_batch_init 的内存分配，并允许底层自动推断 pos。
     """
     token_arr = (llama_token * 1)(token_id)
-    return llama_batch_get_one(token_arr, 1)
+    batch = llama_batch_get_one(token_arr, 1)
+    # 生命周期修复（2026-10-09 崩溃根因定位）：llama_batch_get_one 只保存指针不复制数据，
+    # token_arr 作为局部变量在函数返回后会被 GC 回收，llama_decode 将读到悬空指针——
+    # 表现为概率性 get_rows 越界 abort（GGML_ASSERT(i01 >= 0 && i01 < ne01)），长音频调用
+    # 次数多、踩中概率累积为必然。挂引用到 batch 对象上使其同存亡。
+    batch._token_arr_keepalive = token_arr
+    return batch
 
 class LlamaSampler:
     """采样器的面向对象封装"""
