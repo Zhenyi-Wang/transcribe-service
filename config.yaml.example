@@ -74,3 +74,13 @@ diarization:
   num_speakers: -1              # -1 自动
   embedding_model: "~/models/diarization/wespeaker_cnceleb_resnet34_LM.onnx"
   hf_token: ""                  # 空 = 默认凭据链（~/.cache/huggingface/token）
+  # 内存边界（可靠性护栏：超限请求降级报错，不影响服务其它部分）
+  max_speakers: 16              # 自动模式聚类说话人上限；显式 num_speakers 超过它直接报错（不静默裁剪）
+  max_num_embeddings: 1000      # 聚类子采样上限（pyannote 默认无限 → 全量 O(N²) 距离矩阵）
+  max_reconstruction_mb: 512    # 重建数组双缓冲字节预算（MB），分配前核算、超限降级
+  cudnn_conv_algo_search: "EXHAUSTIVE"  # 改写 pyannote 硬编码的 DEFAULT（可选 DEFAULT/HEURISTIC/EXHAUSTIVE，A/B 用）
+  worker_memory_mb: 4096        # 独立进程 RSS 监测阈值（MiB，50ms 轮询，非内核硬配额）
+  worker_max_jobs: 8            # 每处理此数量的任务回收工作进程，释放会话/驱动资源
+  unknown_duration_timeout: 3600  # 时长元数据失效时的有限预算（秒），不退化成 60 秒
+  failure_cooldown: 3600        # 分离失败的降级结果缓存秒数；到期复用 ASR，只重试分离
+  busy_cooldown: 30             # 工作器繁忙只短期冷却，不因瞬态并发锁死一小时

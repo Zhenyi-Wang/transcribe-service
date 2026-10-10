@@ -142,6 +142,26 @@ class Config:
         """HuggingFace token（gated segmentation 模型；空 = 默认凭据链）"""
         return self.get('diarization.hf_token', '')
 
+    @property
+    def diarization_max_speakers(self) -> int:
+        """自动聚类说话人上限；显式 num_speakers 超过它将被拒绝（不静默裁剪）"""
+        return self.get('diarization.max_speakers', 16)
+
+    @property
+    def diarization_max_num_embeddings(self) -> int:
+        """聚类子采样上限（pyannote 默认 np.inf → O(N²) 距离矩阵；有限值随机下采样）"""
+        return self.get('diarization.max_num_embeddings', 1000)
+
+    @property
+    def diarization_max_reconstruction_mb(self) -> float:
+        """reconstruct 重建数组双缓冲预算（MB），分配前核算、超限降级"""
+        return self.get('diarization.max_reconstruction_mb', 512)
+
+    @property
+    def diarization_cudnn_conv_algo_search(self) -> str:
+        """CUDA EP cudnn_conv_algo_search 改写值（DEFAULT/HEURISTIC/EXHAUSTIVE，A/B 用）"""
+        return self.get('diarization.cudnn_conv_algo_search', 'EXHAUSTIVE')
+
     # ========== 服务器配置 ==========
     @property
     def idle_timeout(self) -> int:
