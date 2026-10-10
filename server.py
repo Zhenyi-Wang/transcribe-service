@@ -22,7 +22,7 @@ from backends.asr_engine_backend import UpstreamPausedError
 from logger_config import setup_logger
 from cache_manager import cache_manager
 from pause_manager import PauseManager, MAX_PAUSE_HOURS
-from diarization import manager as diarization_mgr
+from diarization import worker as diarization_mgr
 from pydantic import BaseModel, Field
 
 # 设置 HuggingFace 缓存目录和日志
@@ -317,6 +317,11 @@ async def startup_event():
     except Exception as e:
         logger.warning(f"预加载失败 - {e}")
         logger.info("服务器将继续启动，将在首次请求时重试加载模型")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await asyncio.to_thread(diarization_mgr.unload_global)
+
 
 # Token验证中间件
 @app.middleware("http")
