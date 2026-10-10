@@ -107,4 +107,5 @@ backend:
 - [diarize_only 仅分离模式](docs/2026-09-24_diarize-only-endpoint.md) — /transcribe_url 的 diarize_only=true 分支：跳过 ASR 只返回说话人时间轴，供 noteflow 官方字幕拼接 speaker（2026-09-24）
 - [暂停端点与 GPU 释放链](docs/2026-09-30_pause-endpoint.md) — /pause /resume /status + 时间权威唯一(transcribe 落盘/推送)+ asr 层暂停语义 + noteflow deferred 挂起(零 DDL,不烧重试)+ 桌面 bat;关键坑:迟到 503 判 paused_at、wakeDeferredTasks 防 auto-import 歧义、5 处错误透传点(2026-09-30)
 - [GGUF 悬空指针崩溃根因与修复](docs/2026-10-09_gguf悬空指针崩溃根因与修复.md) — get_one_batch token 数组被 GC 后 llama_decode 读悬空指针→概率性 get_rows 越界 abort(长音频~80%必崩)；keepalive 修复(commit 4454335)；含排查复盘(两次错误假设)、diarize 超长假死缓解、官方 mtmd 路线挂起的触发条件(2026-10-09)
-- [diarization ONNX Conv Fallback 警告与提速](docs/2026-10-09_diarization-onnx-conv-fallback.md) — pyannote 3.3.2 硬编码 cudnn_conv_algo_search=DEFAULT，cuDNN 9.8+Turing 下全部 Conv 回退慢速核(embedding 慢 3~10 倍+每 Conv×每新形状刷警告)；_load() 期间 monkey-patch InferenceSession 剥掉该选项，零警告且最快(2026-10-09)
+- [diarization ONNX Conv Fallback 警告与提速](docs/2026-10-09_diarization-onnx-conv-fallback.md) — pyannote 硬编码 DEFAULT，短样本中较慢且刷警告；2026-10-10 勘误：FALLBACK 是 cuDNN 计划策略，不等于 CPU 回退；当前可配置 DEFAULT/HEURISTIC/EXHAUSTIVE，默认保持原策略
+- [WSL 提交内存压力与分离资源保护](docs/2026-10-10_wsl-commit-pressure-diarization-safety.md) — commit/物理内存与真实 .wslconfig 核验；分离独立进程回收、聚类/重建/RSS 边界、在途去重、ASR 与失败冷却缓存；短音频验证通过，事故底层分配仍未定案

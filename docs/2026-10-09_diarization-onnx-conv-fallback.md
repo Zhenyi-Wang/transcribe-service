@@ -1,6 +1,8 @@
 # diarization ONNX Conv Fallback 警告刷屏与提速修复
 
-**日期**：2026-10-09　**类型**：根因分析 + 修复　**状态**：已实施
+**日期**：2026-10-09　**类型**：策略分析 + 修复　**状态**：已实施
+
+> 2026-10-10 勘误：修正了原文对 FALLBACK 分支的机制断言。原始短样本速度数据保留，但不能据此证明两小时音频的内存安全性。当前策略可配置为 `DEFAULT` / `HEURISTIC` / `EXHAUSTIVE`，默认显式 `EXHAUSTIVE` 与原来的“剥掉选项”等价。WSL 事件核验与分离资源保护见 [2026-10-10 排查记录](2026-10-10_wsl-commit-pressure-diarization-safety.md)。
 
 ## 现象
 
@@ -17,7 +19,7 @@ tmux `transcribe` 面板每次跑说话人分离刷出 70+ 条警告：
 - 警告全部来自 diarization 的 wespeaker 声纹模型 `wespeaker_cnceleb_resnet34_LM.onnx`（ResNet34，~40 个 Conv 算子）
 - `diarization/manager.py` 把 pyannote 管线 `.to("cuda")` → pyannote 用 CUDA EP 跑该 ONNX
 - **pyannote.audio 3.3.2 在 `speaker_verification.py` 硬编码 `cudnn_conv_algo_search: "DEFAULT"`**
-- 本机组合（onnxruntime-gpu 1.23.2 + 系统 cuDNN 9.8.0 + RTX 2080 Ti Turing）下，DEFAULT 搜索模式给卷积找不到可用 cuDNN 算法 → ORT 全部 Conv 回退内置慢速核，每个 Conv × 每个新输入形状（每 batch 形状不同）各刷一条
+- 本机组合（onnxruntime-gpu 1.23.2 + 系统 cuDNN 9.8.0 + RTX 2080 Ti Turing）下，`DEFAULT` 对应 cuDNN frontend 的 `HeurMode_t::FALLBACK`，ORT 在该分支直接打印警告；这不是“查找失败后退到 CPU”的证据。不同输入形状会重复构建计划并打印警告，短样本中该策略较慢（见下表）。为何这组硬件/模型的该策略更慢，尚未定案。
 - 三组件版本自 2026-09-23 部署 diarization 起从未变过——不是回归，是一直如此，当天才注意到
 
 ## 实测数据（/tmp 隔离复现，同模型同输入）
