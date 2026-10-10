@@ -109,3 +109,4 @@ backend:
 - [GGUF 悬空指针崩溃根因与修复](docs/2026-10-09_gguf悬空指针崩溃根因与修复.md) — get_one_batch token 数组被 GC 后 llama_decode 读悬空指针→概率性 get_rows 越界 abort(长音频~80%必崩)；keepalive 修复(commit 4454335)；含排查复盘(两次错误假设)、diarize 超长假死缓解、官方 mtmd 路线挂起的触发条件(2026-10-09)
 - [diarization ONNX Conv Fallback 警告与提速](docs/2026-10-09_diarization-onnx-conv-fallback.md) — pyannote 硬编码 DEFAULT，短样本中较慢且刷警告；2026-10-10 勘误：FALLBACK 是 cuDNN 计划策略，不等于 CPU 回退；当前可配置 DEFAULT/HEURISTIC/EXHAUSTIVE，默认保持原策略
 - [WSL 提交内存压力与分离资源保护](docs/2026-10-10_wsl-commit-pressure-diarization-safety.md) — commit/物理内存与真实 .wslconfig 核验；分离独立进程回收、聚类/重建/RSS 边界、在途去重、ASR 与失败冷却缓存；短音频验证通过，事故底层分配仍未定案
+- [reconstruct 分块重写](docs/2026-10-10_reconstruct-chunked-rewrite.md) — 512MB 预算拒 2.5h/8人任务的根因与上游调查(#962/#1819/#1963)；分块 reconstruct 峰值与时长解耦（652MB→103MB）且与上游 bitwise 等价；reconstruction_batch_chunks=256；已上线并真实验证（同音频 8人/2545turns/2438段全标注）
