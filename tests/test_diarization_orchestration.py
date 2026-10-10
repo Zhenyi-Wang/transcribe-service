@@ -1,3 +1,5 @@
+import asyncio
+import inspect
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -27,6 +29,13 @@ def _make_service():
     return svc
 
 
+def _fake_infer(fn):
+    async def infer(path, timeout):
+        result = fn(path)
+        return await result if inspect.isawaitable(result) else result
+    return infer
+
+
 def _turns():
     return [SpeakerTurn(0.0, 4.0, 0), SpeakerTurn(4.0, 16.0, 1)]
 
@@ -44,7 +53,7 @@ async def test_diarize_true_attaches_speakers(tmp_path, monkeypatch):
     monkeypatch.setattr(T, "get_audio_duration", lambda p: 8.0)
     _enable_diarization(monkeypatch)
     svc = _make_service()
-    with patch.object(T, "_diarize_samples", lambda path: _turns()):
+    with patch.object(T, "_diarize_samples", _fake_infer(lambda path: _turns())):
         resp = await svc.process_transcription(str(wav), "a.wav", no_cache=True, diarize=True)
     speakers = {seg["speaker"] for seg in resp["body"]}
     assert speakers == {0, 1}
@@ -53,7 +62,7 @@ async def test_diarize_true_attaches_speakers(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_diarize_failure_degrades_and_skips_cache(tmp_path, monkeypatch):
+async def test_diarize_failure_degrades_and_caches_with_cooldown(tmp_path, monkeypatch):
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"")
     monkeypatch.setattr(T, "get_audio_duration", lambda p: 8.0)
@@ -62,13 +71,15 @@ async def test_diarize_failure_degrades_and_skips_cache(tmp_path, monkeypatch):
 
     def boom(path):
         raise RuntimeError("model gone")
-    with patch.object(T, "_diarize_samples", boom), \
+    with patch.object(T, "_diarize_samples", _fake_infer(boom)), \
          patch.object(T.cache_manager, "save_transcript_to_cache") as save_mock:
         resp = await svc.process_transcription(str(wav), "a.wav", no_cache=False,
                                                file_path_for_cache=str(wav), diarize=True)
     assert all("speaker" not in seg for seg in resp["body"])
     assert "speakers" not in resp
-    save_mock.assert_not_called()  # 有 file_path_for_cache 且被跳过 → 证明降级不写缓存
+    assert save_mock.call_count == 2  # ASR 正常缓存 + 带冷却 TTL 的降级缓存
+    assert save_mock.call_args.kwargs["ttl_seconds"] > 0
+    assert resp["diarization"]["status"] == "degraded"
 
 
 @pytest.mark.asyncio
@@ -79,12 +90,13 @@ async def test_diarize_single_speaker_degrades_but_caches(tmp_path, monkeypatch)
     monkeypatch.setattr(T, "get_audio_duration", lambda p: 8.0)
     _enable_diarization(monkeypatch)
     svc = _make_service()
-    with patch.object(T, "_diarize_samples", lambda path: [SpeakerTurn(0.0, 16.0, 0)]), \
+    with patch.object(T, "_diarize_samples", _fake_infer(lambda path: [SpeakerTurn(0.0, 16.0, 0)])), \
          patch.object(T.cache_manager, "save_transcript_to_cache") as save_mock:
         resp = await svc.process_transcription(str(wav), "a.wav", no_cache=False,
                                                file_path_for_cache=str(wav), diarize=True)
     assert all("speaker" not in seg for seg in resp["body"])
-    save_mock.assert_called_once()
+    assert save_mock.call_count == 2  # 独立 ASR 与分离缓存，不带失败 TTL
+    assert "ttl_seconds" not in save_mock.call_args.kwargs
 
 
 @pytest.mark.asyncio
@@ -101,7 +113,7 @@ async def test_diarize_false_baseline(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_diarize_timeout_degrades(tmp_path, monkeypatch):
-    """分离超时 → 降级且不写缓存（patch 超时函数为极小值触发真超时）"""
+    """分离超时 → 降级冷却缓存（patch 超时函数为极小值触发真超时）"""
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"")
     monkeypatch.setattr(T, "get_audio_duration", lambda p: 8.0)
@@ -109,17 +121,17 @@ async def test_diarize_timeout_degrades(tmp_path, monkeypatch):
     _enable_diarization(monkeypatch)
     svc = _make_service()
 
-    def slow(path):
-        import time as _t
-        _t.sleep(1.0)  # 超过 0.05s 超时
+    async def slow(path):
+        await asyncio.sleep(1.0)  # 超过 0.05s 超时
         return _turns()
-    with patch.object(T, "_diarize_samples", slow), \
+    with patch.object(T, "_diarize_samples", _fake_infer(slow)), \
          patch.object(T.cache_manager, "save_transcript_to_cache") as save_mock:
         resp = await svc.process_transcription(str(wav), "a.wav", no_cache=False,
                                                file_path_for_cache=str(wav), diarize=True)
     assert all("speaker" not in seg for seg in resp["body"])
     assert resp["status"] == "success"
-    save_mock.assert_not_called()
+    assert save_mock.call_count == 2
+    assert resp["diarization"]["status"] == "degraded"
 
 
 @pytest.mark.asyncio

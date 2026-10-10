@@ -1,8 +1,12 @@
 import time
 import os
+import math
+import copy
+import uuid
 import asyncio
 import subprocess
 from pathlib import Path
+from contextlib import contextmanager
 from config import config
 from logger_config import setup_logger
 from cache_manager import cache_manager
@@ -50,18 +54,23 @@ def get_audio_duration(file_path: str) -> float:
         float: 音频时长（秒），如果获取失败返回0.0
     """
     try:
-        # 方法1：尝试使用ffprobe（ffmpeg工具）
+        # 方法1：尝试使用ffprobe（ffmpeg工具）；webdav/davfs 抖动时首查易超时，重试一次
         if os.system("which ffprobe > /dev/null 2>&1") == 0:
             cmd = [
                 'ffprobe', '-v', 'quiet', '-show_entries',
                 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1',
                 file_path
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            if result.returncode == 0:
-                duration = float(result.stdout.strip())
-                if duration > 0:
-                    return duration
+            for _ in range(2):
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                except subprocess.TimeoutExpired:
+                    continue
+                if result.returncode == 0:
+                    duration = float(result.stdout.strip())
+                    if duration > 0:
+                        return duration
+                    break
 
         # 方法2：使用mutagen库（如果有安装）
         try:
@@ -74,14 +83,14 @@ def get_audio_duration(file_path: str) -> float:
         except ImportError:
             pass
 
-        # 方法3：尝试使用torchaudio（如果有安装）
+        # 方法3：只读取 soundfile 元数据，不用 torchaudio.load 完整解码长音频
         try:
-            import torchaudio
-            waveform, sample_rate = torchaudio.load(file_path)
-            duration = waveform.shape[1] / sample_rate
-            if duration > 0:
+            import soundfile as sf
+            info = sf.info(file_path)
+            duration = info.frames / info.samplerate
+            if math.isfinite(duration) and duration > 0:
                 return duration
-        except ImportError:
+        except Exception:
             pass
 
         # 方法4：对于WAV文件，使用wave模块
@@ -783,17 +792,48 @@ def _segment_by_punctuation(timestamps: list, text: str) -> list:
     return body if body else generate_subtitle_segments(text)
 
 
-def _diarize_samples(audio_file_path: str):
-    """分离线程函数体：解码 + 推理（重依赖延迟导入；任何异常向上抛由编排层降级）"""
-    from qwen_asr_gguf.inference.audio import load_audio
-    from diarization.manager import get_manager
-    samples = load_audio(audio_file_path)
-    return get_manager().diarize(samples)
+async def _diarize_samples(audio_file_path: str, timeout: float):
+    """分离在独立进程解码/推理；超时和取消会真正回收进程及 ffmpeg。"""
+    from diarization.worker import get_worker
+    return await get_worker().run(audio_file_path, timeout)
 
 
 def _diarize_timeout(audio_duration: float) -> float:
-    """分离超时上限（秒）：下限 60s，随音频时长放宽"""
+    """未知时长不能按短音频处理；实际任务仍受进程 RSS/聚类边界保护。"""
+    if not math.isfinite(audio_duration) or audio_duration <= 0:
+        timeout = float(config.get("diarization.unknown_duration_timeout", 3600))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("diarization.unknown_duration_timeout 必须是有限正数")
+        return timeout
     return max(60.0, audio_duration * 0.5)
+
+
+def _diarize_failure_cooldown(busy=False) -> float:
+    key = "diarization.busy_cooldown" if busy else "diarization.failure_cooldown"
+    seconds = float(config.get(key, 30 if busy else 3600))
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"{key} 必须是有限正数")
+    return seconds
+
+
+async def _run_diarization(audio_file_path: str, audio_duration: float):
+    """共同降级边界，返回 turns/error/elapsed；取消不降级，必须上抛。"""
+    start = time.monotonic()
+    timeout = _diarize_timeout(audio_duration)
+    try:
+        turns = await asyncio.wait_for(_diarize_samples(audio_file_path, timeout), timeout)
+        return turns, None, time.monotonic() - start
+    except asyncio.TimeoutError:
+        logger.warning("说话人分离超时（>%.0fs），工作进程已回收", timeout)
+        return None, {"message": "diarization timeout"}, time.monotonic() - start
+    except Exception as e:
+        from diarization.worker import DiarizationBusyError
+        busy = isinstance(e, DiarizationBusyError)
+        if busy:
+            logger.info("分离工作器繁忙，短期冷却后只重试分离")
+        else:
+            logger.warning("说话人分离失败，本次降级", exc_info=True)
+        return None, {"message": f"diarization failed: {e}", "busy": busy}, time.monotonic() - start
 
 
 async def _diarize_turns_or_error(audio_file_path: str, video_id, download_time: float, total_start: float):
@@ -812,20 +852,11 @@ async def _diarize_turns_or_error(audio_file_path: str, video_id, download_time:
         logger.warning("收到仅分离请求，但 diarization.enabled=false")
         return None, _err("diarization disabled"), timing
 
-    audio_duration = get_audio_duration(audio_file_path)
-    timeout = _diarize_timeout(audio_duration)
-    diarize_start = time.time()
-    try:
-        turns = await asyncio.wait_for(asyncio.to_thread(_diarize_samples, audio_file_path), timeout=timeout)
-    except asyncio.TimeoutError:
-        timing["diarization"] = time.time() - diarize_start
-        logger.warning(f"说话人分离超时（>{timeout:.0f}s）")
-        return None, _err("diarization timeout"), timing
-    except Exception as e:
-        timing["diarization"] = time.time() - diarize_start
-        logger.warning("说话人分离失败", exc_info=True)
-        return None, _err(f"diarization failed: {e}"), timing
-    timing["diarization"] = time.time() - diarize_start
+    audio_duration = await asyncio.to_thread(get_audio_duration, audio_file_path)
+    turns, error, elapsed = await _run_diarization(audio_file_path, audio_duration)
+    timing["diarization"] = elapsed
+    if error:
+        return None, _err(error["message"]), timing
     return turns, None, timing
 
 
@@ -903,13 +934,127 @@ class TranscriptionService:
 
     def __init__(self, model_manager):
         self.model_manager = model_manager
+        self._inflight = {}
+
+    @staticmethod
+    def _cache_args(audio_url, bvid, audio_id, file_path_for_cache, context):
+        if not (file_path_for_cache or audio_url or bvid):
+            return None
+        return {"url": audio_url, "bvid": bvid, "audio_id": audio_id,
+                "file_path": file_path_for_cache, "context": context}
+
+    @staticmethod
+    def _save_diarization_response(response, cache_args, error):
+        if error:
+            cooldown = _diarize_failure_cooldown(busy=error.get("busy", False))
+            response["diarization"] = {"status": "degraded", "reason": error["message"],
+                                       "retry_after": round(time.time() + cooldown)}
+            if cache_args:
+                cache_manager.save_transcript_to_cache(
+                    transcript_data=response, diarize=True, ttl_seconds=cooldown, **cache_args)
+            logger.info("分离降级：保留 ASR 结果，冷却 %.0f 秒后只重试分离", cooldown)
+        else:
+            response["diarization"] = {"status": "success"}
+            if cache_args:
+                cache_manager.save_transcript_to_cache(transcript_data=response, diarize=True, **cache_args)
+
+    async def _annotate_cached_asr(self, cached, audio_file_path, cache_args):
+        start = time.monotonic()
+        response = copy.deepcopy(cached)
+        raw_asr = response.pop("_asr", None)
+        duration = response.get("audio_duration", 0)
+        if not math.isfinite(duration) or duration <= 0:
+            duration = await asyncio.to_thread(get_audio_duration, audio_file_path)
+            response["audio_duration"] = round(duration, 2)
+        turns, error, elapsed = await _run_diarization(audio_file_path, duration)
+        if turns is not None and len({t.speaker for t in turns}) > 1:
+            if raw_asr and raw_asr.get("timestamps"):
+                response["body"] = generate_subtitle_segments_from_timestamps(
+                    raw_asr["text"], raw_asr["timestamps"], raw_asr["language"],
+                    audio_duration=duration, turns=turns)
+            else:
+                # 旧缓存无词级时间戳，沿用官方字幕的段级重叠匹配。
+                response["body"] = _posthoc_align_speakers(response["body"], turns)
+            response["speakers"] = _aggregate_speakers(response["body"])
+        response.setdefault("timing", {}).update({"transcription": 0.0, "diarization": round(elapsed, 3),
+                                                  "total": round(time.monotonic() - start, 3)})
+        response["asr_cached"] = True
+        self._save_diarization_response(response, cache_args, error)
+        return response
+
+    @staticmethod
+    @contextmanager
+    def _audio_lease(audio_file_path):
+        """共享任务保留上传文件的硬链接，路由取消时删除原名不会破坏跟随者。"""
+        source = Path(audio_file_path).absolute()
+        if not source.is_relative_to(Path("tmp").absolute()):
+            yield audio_file_path
+            return
+        lease = source.with_name(f".job-{uuid.uuid4().hex}{source.suffix}")
+        os.link(source, lease)
+        try:
+            yield str(lease)
+        finally:
+            lease.unlink(missing_ok=True)
+
+    async def _shared_transcription(self, audio_file_path, original_filename, audio_url,
+                                     bvid, audio_id, no_cache, file_path_for_cache, context, diarize):
+        job_id = uuid.uuid4().hex[:8]
+        logger.info("转录任务开始: job=%s file=%s diarize=%s", job_id,
+                    original_filename or audio_file_path, diarize)
+        try:
+            with self._audio_lease(audio_file_path) as leased_path:
+                return await self._process_transcription(
+                    leased_path, original_filename or audio_file_path, audio_url, bvid, audio_id,
+                    no_cache, file_path_for_cache, context, diarize)
+        finally:
+            logger.info("转录任务结束: job=%s", job_id)
 
     async def process_transcription(self, audio_file_path: str, original_filename: str = None, audio_url: str = None, bvid: str = None, audio_id: str = None, no_cache: bool = False, file_path_for_cache: str = None, context=None, diarize: bool = False):
+        """同参请求共享独立任务；取消单个请求不影响其他等待者，全部离开才回收。"""
+        context = clamp_asr_context(context)
+        cache_args = self._cache_args(audio_url, bvid, audio_id, file_path_for_cache, context)
+        identity = (cache_manager._get_cache_key(**cache_args, diarize=diarize)
+                    if cache_args else os.path.abspath(audio_file_path))
+        key = (asyncio.get_running_loop(), identity, context, diarize, no_cache)
+        entry = self._inflight.get(key)
+        if entry is None:
+            task = asyncio.create_task(self._shared_transcription(
+                audio_file_path, original_filename, audio_url, bvid, audio_id,
+                no_cache, file_path_for_cache, context, diarize))
+            entry = {"task": task, "waiters": 0}
+            self._inflight[key] = entry
+
+            def finished(done):
+                if self._inflight.get(key) is entry:
+                    self._inflight.pop(key, None)
+                if not done.cancelled():
+                    done.exception()  # 没有等待者时也收取异常，不遗留后台 Task 告警
+
+            task.add_done_callback(finished)
+        else:
+            logger.info("合并重复的在途转录请求: %s", identity)
+        task = entry["task"]
+        entry["waiters"] += 1
+        try:
+            return copy.deepcopy(await asyncio.shield(task))
+        finally:
+            entry["waiters"] -= 1
+            if not entry["waiters"] and not task.done():
+                if self._inflight.get(key) is entry:
+                    self._inflight.pop(key, None)  # 新请求不能加入已决定取消的旧任务
+                task.cancel()
+                try:
+                    await task  # 取消最后一个请求后，等分离进程真正回收
+                except BaseException:
+                    pass
+
+    async def _process_transcription(self, audio_file_path: str, original_filename: str = None, audio_url: str = None, bvid: str = None, audio_id: str = None, no_cache: bool = False, file_path_for_cache: str = None, context=None, diarize: bool = False):
         """处理音频转录的主函数"""
         context = clamp_asr_context(context)  # 理论上限钳制（精确拟合由引擎守卫负责）
         diarize_enabled = bool(diarize and config.diarization_enabled)
         turns = None              # 分离结果（None = 未启用/降级/单人）
-        diarization_failed = False  # 区分「分离失败不写缓存」与「单人成功正常写缓存」
+        diarization_error = None
         timing = {
             "cache_check": 0.0,
             "model_load": 0.0,
@@ -924,27 +1069,19 @@ class TranscriptionService:
             timing["diarization"] = 0.0
         total_start = time.time()
 
-        # 检查转录缓存（除非禁用缓存）
+        # 分离失败的短期降级缓存优先；冷却到期后复用 ASR，只重试分离。
         cache_check_start = time.time()
-        if not no_cache:
-            if file_path_for_cache:
-                cached_result = cache_manager.get_cached_transcript(file_path=file_path_for_cache, context=context, diarize=diarize)
-                if cached_result:
-                    cached_result.pop('cached_at', None)
-                    logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
-                    return cached_result
-            elif audio_id and bvid:
-                cached_result = cache_manager.get_cached_transcript(None, bvid, audio_id, context=context, diarize=diarize)
-                if cached_result:
-                    cached_result.pop('cached_at', None)
-                    logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
-                    return cached_result
-            elif audio_url or bvid:
-                cached_result = cache_manager.get_cached_transcript(audio_url, bvid, context=context, diarize=diarize)
-                if cached_result:
-                    cached_result.pop('cached_at', None)
-                    logger.info(f"使用缓存的转录结果，音频时长: {cached_result.get('audio_duration', 'unknown')}秒")
-                    return cached_result
+        cache_args = self._cache_args(audio_url, bvid, audio_id, file_path_for_cache, context)
+        if not no_cache and cache_args:
+            cached_result = cache_manager.get_cached_transcript(diarize=diarize, **cache_args)
+            if cached_result:
+                cached_result.pop('cached_at', None)
+                logger.info("使用缓存的转录结果，音频时长: %s秒", cached_result.get('audio_duration', 'unknown'))
+                return cached_result
+            if diarize_enabled:
+                asr_cached = cache_manager.get_cached_transcript(diarize=False, include_asr=True, **cache_args)
+                if asr_cached:
+                    return await self._annotate_cached_asr(asr_cached, audio_file_path, cache_args)
         timing["cache_check"] = time.time() - cache_check_start
 
         try:
@@ -954,7 +1091,7 @@ class TranscriptionService:
             timing["model_load"] = time.time() - model_load_start
         except Exception as e:
             duration_start = time.time()
-            audio_duration = get_audio_duration(audio_file_path)
+            audio_duration = await asyncio.to_thread(get_audio_duration, audio_file_path)
             timing["duration_detect"] = time.time() - duration_start
             timing["total"] = time.time() - total_start
             return {
@@ -973,7 +1110,7 @@ class TranscriptionService:
             # 2. 获取音频时长
             filename_to_log = original_filename or audio_file_path
             duration_start = time.time()
-            audio_duration = get_audio_duration(audio_file_path)
+            audio_duration = await asyncio.to_thread(get_audio_duration, audio_file_path)
             timing["duration_detect"] = time.time() - duration_start
             if audio_duration > 0:
                 logger.info(f"音频时长: {audio_duration:.2f}秒")
@@ -982,49 +1119,21 @@ class TranscriptionService:
 
             logger.info(f"开始识别: {filename_to_log}")
 
-            # 3. 调用后端转录 + 可选说话人分离（并行，独立线程）
+            # 3. ASR 与分离并行；分离在可终止进程中，异常/取消都等待真正回收。
             transcription_start_time = time.time()
             if diarize_enabled:
-                diarize_timeout = _diarize_timeout(audio_duration)
-                diarize_start = time.time()
-
-                async def _diarize_job():
-                    t0 = time.time()
-                    try:
-                        turns = await asyncio.to_thread(_diarize_samples, audio_file_path)
-                        return turns, time.time() - t0
-                    except Exception:
-                        logger.warning("说话人分离失败，本次降级为无 speaker 输出（不写缓存）", exc_info=True)
-                        return None, time.time() - t0
-
-                asr_task = asyncio.create_task(
-                    asyncio.to_thread(backend.transcribe, audio_file_path, None, context))
-                diar_task = asyncio.create_task(
-                    asyncio.wait_for(_diarize_job(), timeout=diarize_timeout))
-                diar_elapsed = 0.0
+                diar_task = asyncio.create_task(_run_diarization(audio_file_path, audio_duration))
                 try:
-                    result = await asr_task  # ASR 异常照旧冒泡给外层 except
+                    result = await asyncio.to_thread(backend.transcribe, audio_file_path, None, context)
+                    processing_time = time.time() - transcription_start_time
+                    turns, diarization_error, diar_elapsed = await diar_task
                 except BaseException:
-                    # ASR 失败时回收分离任务，避免后台线程继续占用 GPU/推理锁
                     diar_task.cancel()
                     try:
                         await diar_task
                     except BaseException:
                         pass
                     raise
-                processing_time = time.time() - transcription_start_time  # ASR 耗时快照（语义不变）
-                try:
-                    turns, diar_elapsed = await diar_task
-                except asyncio.TimeoutError:
-                    diar_elapsed = time.time() - diarize_start
-                    logger.warning(f"说话人分离超时（>{diarize_timeout:.0f}s），降级且不写缓存")
-                    turns, diarization_failed = None, True
-                except Exception:
-                    diar_elapsed = time.time() - diarize_start
-                    logger.warning("说话人分离任务异常，降级且不写缓存", exc_info=True)
-                    turns, diarization_failed = None, True
-                if turns is None:
-                    diarization_failed = True  # job 内部异常降级同样标记
                 timing["diarization"] = diar_elapsed
             else:
                 result = await asyncio.to_thread(backend.transcribe, audio_file_path, None, context)
@@ -1098,16 +1207,25 @@ class TranscriptionService:
             if subtitle_body and "speaker" in subtitle_body[0]:
                 response["speakers"] = _aggregate_speakers(subtitle_body)
 
-            # 保存到缓存（分离失败降级时跳过，下次请求重试分离）
+            # ASR 与分离结果分别缓存：分离失败不能丢掉已经完成的长音频 ASR。
             cache_save_start = time.time()
-            if diarization_failed:
-                logger.info("分离降级：本次结果不写入缓存（下次请求将重试分离）")
-            elif file_path_for_cache:
-                cache_manager.save_transcript_to_cache(file_path=file_path_for_cache, transcript_data=response, context=context, diarize=diarize)
-            elif audio_id and bvid:
-                cache_manager.save_transcript_to_cache(None, response, bvid, audio_id, context=context, diarize=diarize)
-            elif audio_url or bvid:
-                cache_manager.save_transcript_to_cache(audio_url, response, bvid, context=context, diarize=diarize)
+            if diarize_enabled:
+                if cache_args:
+                    baseline = copy.deepcopy(response)
+                    baseline.pop("speakers", None)
+                    baseline["_asr"] = {"text": transcript_text, "language": detected_lang,
+                                         "timestamps": timestamps}
+                    if timestamps and turns is not None:
+                        baseline["body"] = generate_subtitle_segments_from_timestamps(
+                            transcript_text, timestamps, detected_lang, audio_duration=audio_duration)
+                    cache_manager.save_transcript_to_cache(
+                        transcript_data=baseline, diarize=False, **cache_args)
+                self._save_diarization_response(response, cache_args, diarization_error)
+            elif cache_args:
+                baseline = copy.deepcopy(response)
+                baseline["_asr"] = {"text": transcript_text, "language": detected_lang,
+                                     "timestamps": timestamps}
+                cache_manager.save_transcript_to_cache(transcript_data=baseline, diarize=diarize, **cache_args)
             timing["cache_save"] = time.time() - cache_save_start
             response["timing"]["cache_save"] = round(timing["cache_save"], 3)
             response["timing"]["total"] = round(time.time() - total_start, 3)
@@ -1135,7 +1253,7 @@ class TranscriptionService:
                 audio_duration = locals()['audio_duration']
             else:
                 duration_start = time.time()
-                audio_duration = get_audio_duration(audio_file_path)
+                audio_duration = await asyncio.to_thread(get_audio_duration, audio_file_path)
                 timing["duration_detect"] = time.time() - duration_start
 
             processing_time = 0.0

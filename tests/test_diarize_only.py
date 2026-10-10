@@ -3,6 +3,14 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 import asyncio
+import inspect
+
+
+def _fake_infer(fn):
+    async def infer(path, timeout):
+        result = fn(path)
+        return await result if inspect.isawaitable(result) else result
+    return infer
 
 import transcribe as T
 from diarization.manager import SpeakerTurn
@@ -20,7 +28,7 @@ async def test_success_returns_turns_and_speakers(tmp_path, monkeypatch):
     monkeypatch.setattr(T, "get_audio_duration", lambda p: 100.0)
     _enable_diarization(monkeypatch)
     turns = [SpeakerTurn(0.0, 40.0, 0), SpeakerTurn(40.0, 100.0, 1)]
-    with patch.object(T, "_diarize_samples", lambda path: turns):
+    with patch.object(T, "_diarize_samples", _fake_infer(lambda path: turns)):
         resp = await T.diarize_only(str(wav), "BV1xx", download_time=1.5)
     assert resp["status"] == "success"
     assert resp["video_id"] == "BV1xx"
@@ -43,7 +51,7 @@ async def test_single_speaker_returned_as_is(tmp_path, monkeypatch):
     wav.write_bytes(b"")
     monkeypatch.setattr(T, "get_audio_duration", lambda p: 10.0)
     _enable_diarization(monkeypatch)
-    with patch.object(T, "_diarize_samples", lambda path: [SpeakerTurn(0.0, 10.0, 0)]):
+    with patch.object(T, "_diarize_samples", _fake_infer(lambda path: [SpeakerTurn(0.0, 10.0, 0)])):
         resp = await T.diarize_only(str(wav))
     assert resp["status"] == "success"
     assert resp["speakers"] == [{"id": 0, "duration": 10.0, "turns": 1}]
@@ -71,7 +79,7 @@ async def test_diarization_failure_returns_error(tmp_path, monkeypatch):
 
     def boom(path):
         raise RuntimeError("model gone")
-    with patch.object(T, "_diarize_samples", boom):
+    with patch.object(T, "_diarize_samples", _fake_infer(boom)):
         resp = await T.diarize_only(str(wav))
     assert resp["status"] == "error"
     assert "model gone" in resp["message"]
@@ -87,32 +95,36 @@ async def test_timeout_returns_error(tmp_path, monkeypatch):
     monkeypatch.setattr(T, "_diarize_timeout", lambda d: 0.05)
     _enable_diarization(monkeypatch)
 
-    def slow(path):
-        import time as _t
-        _t.sleep(1.0)
+    async def slow(path):
+        await asyncio.sleep(1.0)
         return [SpeakerTurn(0.0, 10.0, 0)]
-    with patch.object(T, "_diarize_samples", slow):
+    with patch.object(T, "_diarize_samples", _fake_infer(slow)):
         resp = await T.diarize_only(str(wav))
     assert resp["status"] == "error"
     assert "timeout" in resp["message"]
 
 
 @pytest.mark.asyncio
-async def test_timeout_cancels_underlying_thread_job(tmp_path, monkeypatch):
-    """wait_for 超时后 asyncio.to_thread 无法中断线程，但等待本身必须解除（响应不被卡死）"""
+async def test_timeout_finishes_cleanup_before_returning(tmp_path, monkeypatch):
+    """编排超时会等待分离协程完成回收；真实进程回收另由 worker 测试覆盖。"""
     wav = tmp_path / "a.wav"
     wav.write_bytes(b"")
     monkeypatch.setattr(T, "get_audio_duration", lambda p: 10.0)
     monkeypatch.setattr(T, "_diarize_timeout", lambda d: 0.05)
     _enable_diarization(monkeypatch)
 
-    def hang(path):
-        import time as _t
-        _t.sleep(5.0)
+    cleaned = []
+
+    async def hang(path):
+        try:
+            await asyncio.sleep(5.0)
+        finally:
+            cleaned.append(True)
         return []
-    with patch.object(T, "_diarize_samples", hang):
+    with patch.object(T, "_diarize_samples", _fake_infer(hang)):
         resp = await asyncio.wait_for(T.diarize_only(str(wav)), timeout=3.0)
     assert resp["status"] == "error"
+    assert cleaned == [True]
 
 
 # ==================== 分离+字幕标注拼接模式（diarize_merge_subtitle） ====================
@@ -132,7 +144,7 @@ async def test_merge_success_annotates_body(tmp_path, monkeypatch):
     monkeypatch.setattr(T, "get_audio_duration", lambda p: 20.0)
     _enable_diarization(monkeypatch)
     turns = [SpeakerTurn(0.0, 7.0, 0), SpeakerTurn(7.0, 20.0, 1)]
-    with patch.object(T, "_diarize_samples", lambda path: turns):
+    with patch.object(T, "_diarize_samples", _fake_infer(lambda path: turns)):
         resp = await T.diarize_merge_subtitle(SUBTITLE_BODY, str(wav), "BV1xx", download_time=1.0)
     assert resp["status"] == "success"
     assert [seg["speaker"] for seg in resp["body"]] == [0, 0, 1]
@@ -154,7 +166,7 @@ async def test_merge_cross_boundary_segment_gets_minus_one(tmp_path, monkeypatch
     _enable_diarization(monkeypatch)
     turns = [SpeakerTurn(0.0, 3.0, 0), SpeakerTurn(7.0, 20.0, 1)]
     body = [{"from": 2.0, "to": 10.0, "content": "横跨两人的长段"}]  # 段长 8s，重叠各 1s/3s，最大 3s < 4s
-    with patch.object(T, "_diarize_samples", lambda path: turns):
+    with patch.object(T, "_diarize_samples", _fake_infer(lambda path: turns)):
         resp = await T.diarize_merge_subtitle(body, str(wav))
     assert resp["status"] == "success"
     assert resp["body"][0]["speaker"] == -1
@@ -167,7 +179,7 @@ async def test_merge_single_speaker_success_unannotated(tmp_path, monkeypatch):
     wav.write_bytes(b"")
     monkeypatch.setattr(T, "get_audio_duration", lambda p: 20.0)
     _enable_diarization(monkeypatch)
-    with patch.object(T, "_diarize_samples", lambda path: [SpeakerTurn(0.0, 20.0, 0)]):
+    with patch.object(T, "_diarize_samples", _fake_infer(lambda path: [SpeakerTurn(0.0, 20.0, 0)])):
         resp = await T.diarize_merge_subtitle(SUBTITLE_BODY, str(wav))
     assert resp["status"] == "success"
     assert resp["annotated"] is False
