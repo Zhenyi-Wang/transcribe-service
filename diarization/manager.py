@@ -9,8 +9,12 @@
   建 O(N²) 距离矩阵（长音频 GB 级）；设有限值后随机下采样到该上限。
 - max_speakers：自动模式聚类簇数上限，随管线调用传入（约束 set_num_clusters
   的 max_clusters 并截断 speaker count）；显式 num_speakers 超过它直接拒绝。
-- max_reconstruction_mb：reconstruct 重建数组双缓冲字节预算（见
-  _bounded_speaker_diarization_class），分配前核算，超限抛可降级异常。
+- max_reconstruction_mb：reconstruct 分块重建峰值字节预算（见
+  _bounded_speaker_diarization_class）。上游 3.3.2 一次性分配 float64
+  (num_chunks, num_frames, num_clusters) 稠密数组（O(时长×说话人数)，长音频
+  GB 级，上游 issue #962/#1819/#1963 均未修），覆盖版按 reconstruction_batch_chunks
+  分批填充 float32 批数组、逐 chunk overlap-add 到全局 float32 激活，峰值与
+  总 chunk 数无关；预算核算的是批数组 + 全局激活族的峰值上界，超限抛可降级异常。
 """
 import logging
 import math
@@ -30,11 +34,12 @@ logger = logging.getLogger("diarization")
 DEFAULT_MAX_SPEAKERS = 16
 DEFAULT_MAX_NUM_EMBEDDINGS = 1000
 DEFAULT_MAX_RECONSTRUCTION_MB = 512
+DEFAULT_RECONSTRUCTION_BATCH_CHUNKS = 256
 
 # cudnn_conv_algo_search 合法取值（ORT CUDA EP 选项；EXHAUSTIVE=ORT 自身默认）
 CUDNN_CONV_ALGO_CHOICES = ("DEFAULT", "HEURISTIC", "EXHAUSTIVE")
 
-_FLOAT64_ITEMSIZE = 8  # reconstruct 重建数组 dtype（np.nan * np.zeros 默认 float64）
+_FLOAT32_ITEMSIZE = 4  # 分块重建的批数组/全局激活 dtype（与上游 aggregate 累加器一致）
 
 
 class DiarizationResourceLimitError(RuntimeError):
@@ -131,18 +136,23 @@ def _strip_cudnn_conv_algo_search_default(target: str = "EXHAUSTIVE"):
 
 
 def check_reconstruction_budget(seg_shape, hard_clusters, max_bytes=None,
-                                max_speakers=None) -> dict:
-    """reconstruct 大分配前的预算检查（纯函数，供重建守卫与测试直接调用）。
+                                max_speakers=None, batch_chunks=None,
+                                num_total_frames=None) -> dict:
+    """reconstruct 分块重建前的预算检查（纯函数，供重建守卫与测试直接调用）。
 
-    pyannote 的 reconstruct 无条件分配 float64 (num_chunks, num_frames,
-    num_clusters)：np.nan * np.zeros(...) 期间 zeros 与乘积两个数组并存（双缓冲），
-    num_clusters 仅由 hard_clusters 决定、无上限。这里在分配前：
+    上游 3.3.2 的 reconstruct 一次性分配 float64 (num_chunks, num_frames,
+    num_clusters)，内存 O(时长×说话人数)。覆盖版改为分块后，峰值上界只由
+    批数组（batch_chunks × num_frames × num_clusters × float32）与全局激活族
+    （num_total_frames × num_clusters 的 float32 数组若干：累加器、覆盖掩码、
+    pad/binary/argsort 临时）构成。这里在分配前：
 
     - 校验 hard_clusters 形状与 segmentations 前两轴一致
     - 按实际 hard_clusters 核算簇数（> max_speakers 视为上游约束失效，拒绝）
-    - 按双缓冲核算预计字节，超过 max_bytes 抛 DiarizationResourceLimitError
+    - 按上述口径核算峰值字节（激活族按 6 份保守计），超过 max_bytes 抛
+      DiarizationResourceLimitError
 
-    返回 {"num_chunks", "num_frames", "num_clusters", "bytes", "bytes_doubled"} 供日志。
+    num_total_frames 未知时（纯函数测试场景）以 num_chunks × num_frames 为
+    宽松上界。返回形状/批数/字节明细供日志。
     """
     num_chunks, num_frames, local_num_speakers = (int(x) for x in seg_shape)
     hard_clusters = np.asarray(hard_clusters)
@@ -155,18 +165,25 @@ def check_reconstruction_budget(seg_shape, hard_clusters, max_bytes=None,
         raise DiarizationResourceLimitError(
             f"reconstruct 实际簇数 {num_clusters} 超过 max_speakers={max_speakers}"
             f"（上游聚类约束失效），拒绝重建")
-    # 双缓冲：np.nan * np.zeros(...) 的 zeros 与乘积数组并存；后续 aggregate 还会
-    # 再分配同量级缓冲，故 2x 是预算下限（按"至少双缓冲"口径核算）
-    bytes_needed = num_chunks * num_frames * num_clusters * _FLOAT64_ITEMSIZE
-    if max_bytes is not None and 2 * bytes_needed > int(max_bytes):
+    if batch_chunks is None:
+        batch_chunks = DEFAULT_RECONSTRUCTION_BATCH_CHUNKS
+    batch_chunks = _require_positive_int("reconstruction_batch_chunks", batch_chunks)
+    batch_bytes = batch_chunks * num_frames * num_clusters * _FLOAT32_ITEMSIZE
+    if num_total_frames is None:
+        num_total_frames = num_chunks * num_frames  # 宽松上界（真实 T ≈ 覆盖时长/帧步）
+    activation_bytes = int(num_total_frames) * num_clusters * _FLOAT32_ITEMSIZE
+    bytes_total = batch_bytes + 6 * activation_bytes
+    if max_bytes is not None and bytes_total > int(max_bytes):
         raise DiarizationResourceLimitError(
-            f"reconstruct 预计分配 {2 * bytes_needed / 1048576:.1f}MB（双缓冲）超过上限 "
+            f"reconstruct 分块重建预计峰值 {bytes_total / 1048576:.1f}MB 超过上限 "
             f"{int(max_bytes) / 1048576:.0f}MB：num_chunks={num_chunks} "
-            f"num_frames={num_frames} num_clusters={num_clusters}。"
-            f"可调大 diarization.max_reconstruction_mb 或降低音频时长")
+            f"num_frames={num_frames} num_clusters={num_clusters} "
+            f"batch_chunks={batch_chunks}。可调大 diarization.max_reconstruction_mb")
     return {"num_chunks": num_chunks, "num_frames": num_frames,
-            "num_clusters": num_clusters, "bytes": bytes_needed,
-            "bytes_doubled": 2 * bytes_needed}
+            "num_clusters": num_clusters, "batch_chunks": batch_chunks,
+            "num_batches": (num_chunks + batch_chunks - 1) // batch_chunks,
+            "batch_bytes": batch_bytes, "activation_bytes": activation_bytes,
+            "bytes_total": bytes_total}
 
 
 # 带重建守卫的管线子类缓存（_bounded_speaker_diarization_class 懒构造一次）
@@ -184,28 +201,101 @@ def _bounded_speaker_diarization_class():
         return _BOUNDED_PIPELINE_CLASS
 
     from pyannote.audio.pipelines.speaker_diarization import SpeakerDiarization  # 延迟导入
+    from pyannote.core import SlidingWindow, SlidingWindowFeature  # 延迟导入
 
     class BoundedSpeakerDiarization(SpeakerDiarization):
-        """SpeakerDiarization + reconstruct 内存边界。
+        """SpeakerDiarization + reconstruct 常数内存重建。
 
-        覆盖版在父实现分配前核对形状与实际簇数、按双缓冲字节核算预算，
-        超限抛 DiarizationResourceLimitError（编排层降级），不发生大分配。
+        上游 reconstruct 一次性分配 float64 (num_chunks, num_frames, num_clusters)
+        稠密数组（O(时长×说话人数)），再交 Inference.aggregate 做 overlap-add。
+        覆盖版逐字复刻「填充 + aggregate(skip_average=True) + to_diarization 后
+        半段」的数值路径，但按 _reconstruction_batch_chunks 分批持有 float32 批
+        数组、按上游相同的 chunk 顺序向全局 float32 累加器累加——求和可结合，
+        chunk 顺序不变，结果与上游数值一致（批值为 float32 可精确表示的 sigmoid
+        概率，乘 0/1 掩码后进入与上游相同的 float64→float32 累加路径）。
+        分配前核对形状/簇数/峰值预算，超限抛 DiarizationResourceLimitError。
         """
 
         _max_reconstruction_bytes = None
         _max_speakers = None
+        _reconstruction_batch_chunks = None
 
         def reconstruct(self, segmentations, hard_clusters, count):
+            num_chunks, num_frames, _local = segmentations.data.shape
+            chunks = segmentations.sliding_window
+            # 与 Inference.aggregate 相同的输出帧网格：忽略传入 frames.start，
+            # 强制以 chunks.start 为原点（hamming=False / warm_up=(0,0) /
+            # missing=0.0 为 to_diarization 的调用参数）
+            frames = SlidingWindow(start=chunks.start,
+                                   duration=count.sliding_window.duration,
+                                   step=count.sliding_window.step)
+            num_total_frames = frames.closest_frame(
+                chunks.start + chunks.duration
+                + (num_chunks - 1) * chunks.step + 0.5 * frames.duration) + 1
             info = check_reconstruction_budget(
                 segmentations.data.shape, hard_clusters,
                 max_bytes=self._max_reconstruction_bytes,
-                max_speakers=self._max_speakers)
+                max_speakers=self._max_speakers,
+                batch_chunks=self._reconstruction_batch_chunks,
+                num_total_frames=num_total_frames)
             logger.info(
                 "[diarization][reconstruct] chunks=%d frames=%d clusters=%d "
-                "预计分配=%.1fMB(双缓冲) rss=%s",
+                "batches=%d 预计峰值=%.1fMB(分块) rss=%s",
                 info["num_chunks"], info["num_frames"], info["num_clusters"],
-                info["bytes_doubled"] / 1048576.0, _proc_rss_mb())
-            return super().reconstruct(segmentations, hard_clusters, count)
+                info["num_batches"], info["bytes_total"] / 1048576.0,
+                _proc_rss_mb())
+
+            num_clusters = info["num_clusters"]
+            batch_chunks = info["batch_chunks"]
+            # 全局累加器与覆盖掩码（float32，与 Inference.aggregate 内部一致）
+            aggregated = np.zeros((num_total_frames, num_clusters), dtype=np.float32)
+            coverage = np.zeros((num_total_frames, num_clusters), dtype=np.float32)
+
+            for c0 in range(0, num_chunks, batch_chunks):
+                c1 = min(c0 + batch_chunks, num_chunks)
+                batch = np.full((c1 - c0, num_frames, num_clusters),
+                                np.nan, dtype=np.float32)
+                # 填充循环：逐字对齐上游（含 k==-2 跳过与负索引列怪癖）
+                for j in range(c0, c1):
+                    cluster = hard_clusters[j]
+                    segmentation = segmentations.data[j]
+                    for k in np.unique(cluster):
+                        if k == -2:
+                            continue
+                        batch[j - c0, :, k] = np.max(
+                            segmentation[:, cluster == k], axis=1)
+                # 累加循环：逐字对齐 Inference.aggregate（skip_average 分支），
+                # 保持上游 chunk 顺序 → 数值一致
+                for j in range(c0, c1):
+                    chunk = chunks[j]
+                    score = batch[j - c0]
+                    mask = 1 - np.isnan(score)
+                    np.nan_to_num(score, copy=False, nan=0.0)
+                    start_frame = frames.closest_frame(
+                        chunk.start + 0.5 * frames.duration)
+                    aggregated[start_frame:start_frame + num_frames] += score * mask
+                    coverage[start_frame:start_frame + num_frames] = np.maximum(
+                        coverage[start_frame:start_frame + num_frames], mask)
+                del batch
+            # missing=0.0：无覆盖帧保持 0（初始即 0，与上游显式赋值等价）
+
+            # to_diarization 后半段（pad → extent 交集 crop → 按帧 count 取 top-c）
+            activations = SlidingWindowFeature(aggregated, frames)
+            _, num_speakers = activations.data.shape
+            max_speakers_per_frame = np.max(count.data)
+            if num_speakers < max_speakers_per_frame:
+                activations.data = np.pad(
+                    activations.data,
+                    ((0, 0), (0, max_speakers_per_frame - num_speakers)))
+            extent = activations.extent & count.extent
+            activations = activations.crop(extent, return_data=False)
+            count = count.crop(extent, return_data=False)
+            sorted_speakers = np.argsort(-activations.data, axis=-1)
+            binary = np.zeros_like(activations.data)
+            for t, ((_segment, c), speakers) in enumerate(zip(count, sorted_speakers)):
+                for i in range(c.item()):
+                    binary[t, speakers[i]] = 1.0
+            return SlidingWindowFeature(binary, activations.sliding_window)
 
     _BOUNDED_PIPELINE_CLASS = BoundedSpeakerDiarization
     return _BOUNDED_PIPELINE_CLASS
@@ -243,6 +333,7 @@ class DiarizationManager:
                  max_speakers: int = DEFAULT_MAX_SPEAKERS,
                  max_num_embeddings: int = DEFAULT_MAX_NUM_EMBEDDINGS,
                  max_reconstruction_mb: float = DEFAULT_MAX_RECONSTRUCTION_MB,
+                 reconstruction_batch_chunks: int = DEFAULT_RECONSTRUCTION_BATCH_CHUNKS,
                  cudnn_conv_algo_search: Optional[str] = None):
         # 边界参数先于 num_speakers 验证（后者依赖 max_speakers）；
         # 全部硬验证，非法配置在构造期即失败（get_manager/工作进程皆走此路径）
@@ -250,6 +341,8 @@ class DiarizationManager:
         self.max_num_embeddings = _require_positive_int("max_num_embeddings", max_num_embeddings)
         self.max_reconstruction_mb = _require_positive_number("max_reconstruction_mb",
                                                               max_reconstruction_mb)
+        self.reconstruction_batch_chunks = _require_positive_int(
+            "reconstruction_batch_chunks", reconstruction_batch_chunks)
         self.num_speakers = _validate_num_speakers(num_speakers, self.max_speakers)
         if cudnn_conv_algo_search is None:
             cudnn_conv_algo_search = config.diarization_cudnn_conv_algo_search
@@ -297,6 +390,7 @@ class DiarizationManager:
                 pipeline.clustering.max_num_embeddings = self.max_num_embeddings
                 pipeline._max_reconstruction_bytes = int(self.max_reconstruction_mb * 1048576)
                 pipeline._max_speakers = self.max_speakers
+                pipeline._reconstruction_batch_chunks = self.reconstruction_batch_chunks
                 pipeline.to(torch.device("cuda"))
             self._pipeline = pipeline
             logger.info(
@@ -304,6 +398,7 @@ class DiarizationManager:
                 f"max_speakers={self.max_speakers}, "
                 f"max_num_embeddings={self.max_num_embeddings}, "
                 f"max_reconstruction_mb={self.max_reconstruction_mb:g}, "
+                f"reconstruction_batch_chunks={self.reconstruction_batch_chunks}, "
                 f"cudnn_conv_algo_search={self.cudnn_conv_algo_search}）")
 
     def _log_pipeline_stage(self, step_name, artefact, **kwargs):
@@ -408,6 +503,7 @@ def get_manager() -> DiarizationManager:
                     max_speakers=config.diarization_max_speakers,
                     max_num_embeddings=config.diarization_max_num_embeddings,
                     max_reconstruction_mb=config.diarization_max_reconstruction_mb,
+                    reconstruction_batch_chunks=config.diarization_reconstruction_batch_chunks,
                     cudnn_conv_algo_search=config.diarization_cudnn_conv_algo_search,
                 )
     return _manager

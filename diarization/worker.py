@@ -63,6 +63,7 @@ def _manager_settings():
         "max_speakers": config.diarization_max_speakers,
         "max_num_embeddings": config.diarization_max_num_embeddings,
         "max_reconstruction_mb": config.diarization_max_reconstruction_mb,
+        "reconstruction_batch_chunks": config.diarization_reconstruction_batch_chunks,
         "cudnn_conv_algo_search": config.diarization_cudnn_conv_algo_search,
     }
 

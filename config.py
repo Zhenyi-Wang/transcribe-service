@@ -154,8 +154,13 @@ class Config:
 
     @property
     def diarization_max_reconstruction_mb(self) -> float:
-        """reconstruct 重建数组双缓冲预算（MB），分配前核算、超限降级"""
+        """reconstruct 分块重建峰值预算（MB），分配前核算、超限降级"""
         return self.get('diarization.max_reconstruction_mb', 512)
+
+    @property
+    def diarization_reconstruction_batch_chunks(self) -> int:
+        """reconstruct 分块重建的批大小（chunk 数）：峰值内存与音频时长解耦"""
+        return self.get('diarization.reconstruction_batch_chunks', 256)
 
     @property
     def diarization_cudnn_conv_algo_search(self) -> str:

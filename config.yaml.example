@@ -77,7 +77,9 @@ diarization:
   # 内存边界（可靠性护栏：超限请求降级报错，不影响服务其它部分）
   max_speakers: 16              # 自动模式聚类说话人上限；显式 num_speakers 超过它直接报错（不静默裁剪）
   max_num_embeddings: 1000      # 聚类子采样上限（pyannote 默认无限 → 全量 O(N²) 距离矩阵）
-  max_reconstruction_mb: 512    # 重建数组双缓冲字节预算（MB），分配前核算、超限降级
+  max_reconstruction_mb: 512    # 分块重建峰值字节预算（MB），分配前核算、超限降级
+  reconstruction_batch_chunks: 256  # 分块重建批大小（chunk 数）：峰值内存与音频时长/说话人数解耦
+                                    # （上游一次性 float64 稠密展开 O(时长×人数)，2.5h×8人即 652MB）
   cudnn_conv_algo_search: "EXHAUSTIVE"  # 改写 pyannote 硬编码的 DEFAULT（可选 DEFAULT/HEURISTIC/EXHAUSTIVE，A/B 用）
   worker_memory_mb: 4096        # 独立进程 RSS 监测阈值（MiB，50ms 轮询，非内核硬配额）
   worker_max_jobs: 8            # 每处理此数量的任务回收工作进程，释放会话/驱动资源
