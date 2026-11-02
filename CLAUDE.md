@@ -93,7 +93,7 @@ backend:
 |----------|------|
 | `POST /transcribe` | 上传音频文件转录 |
 | `POST /transcribe_url` | B站视频转录（BV号 + cookie） |
-| `POST /transcribe_file` | 网盘文件转录（路径相对 webdav.base_path） |
+| `POST /transcribe_file` | 网盘文件转录（路径相对 webdav.base_path）；**转录成功后自动归档 inbox→processed**（webdav_archive.py，失败静默记日志，见 docs/2026-11-02） |
 
 ## Environment
 
