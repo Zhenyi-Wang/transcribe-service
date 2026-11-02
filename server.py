@@ -23,6 +23,7 @@ from logger_config import setup_logger
 from cache_manager import cache_manager
 from pause_manager import PauseManager, MAX_PAUSE_HOURS
 from diarization import worker as diarization_mgr
+import webdav_archive
 from pydantic import BaseModel, Field
 
 # 设置 HuggingFace 缓存目录和日志
@@ -528,6 +529,11 @@ async def transcribe_webdav_file(request: WebdavTranscribeRequest):
                 context=request.context,
                 diarize=request.diarize
             )
+
+            # 转录成功后归档 inbox -> processed（2026-11-02 改造，接替 mryk24「创建任务即移动」；
+            # 幂等跳过/防覆盖/伴移在 move_to_processed 内处理，失败静默记日志不影响转录返回）
+            if isinstance(result, dict) and result.get("status") != "error":
+                webdav_archive.move_to_processed(webdav_base, relative_path)
 
             return result
 
