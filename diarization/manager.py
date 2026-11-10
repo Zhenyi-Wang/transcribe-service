@@ -39,6 +39,10 @@ DEFAULT_RECONSTRUCTION_BATCH_CHUNKS = 256
 # cudnn_conv_algo_search 合法取值（ORT CUDA EP 选项；EXHAUSTIVE=ORT 自身默认）
 CUDNN_CONV_ALGO_CHOICES = ("DEFAULT", "HEURISTIC", "EXHAUSTIVE")
 
+# pyannote hook step 名 → 五段阶段名（spec §5「并行分离」，起点锚定）。
+# 聚类无钩子（在嵌入阶段末尾的管线缝隙补发），reconstructing 由自研子类直发。
+_PIPELINE_STAGE_START_BY_STEP = {"segmentation": "segmenting", "embeddings": "embedding"}
+
 _FLOAT32_ITEMSIZE = 4  # 分块重建的批数组/全局激活 dtype（与上游 aggregate 累加器一致）
 
 
@@ -221,6 +225,11 @@ def _bounded_speaker_diarization_class():
         _reconstruction_batch_chunks = None
 
         def reconstruct(self, segmentations, hard_clusters, count):
+            # 重建段起点直发（spec §5 五段之一）：发射闭包由 manager.diarize 暂存到
+            # 管线实例（_infer_lock 内单飞推理，无交错；见其 _stage_hook docstring）。
+            emit = getattr(self, "_diarize_stage_emit", None)
+            if emit is not None:
+                emit("reconstructing")
             num_chunks, num_frames, _local = segmentations.data.shape
             chunks = segmentations.sliding_window
             # 与 Inference.aggregate 相同的输出帧网格：忽略传入 frames.start，
@@ -423,6 +432,49 @@ class DiarizationManager:
             logger.debug("管线阶段日志失败", exc_info=True)
 
     @staticmethod
+    def _stage_emit(stage_cb):
+        """stage_cb → 吞异常的发射闭包；stage_cb 为 None 时返回 None（零开销遗留路径）。
+
+        契约与 progress_cb 一致：回调不得抛异常；此处兜底保证发射失败不中断推理。
+        """
+        if stage_cb is None:
+            return None
+
+        def emit(name):
+            try:
+                stage_cb(name)
+            except Exception:
+                logger.debug("分离阶段回调失败", exc_info=True)
+        return emit
+
+    def _stage_hook(self, emit):
+        """五段阶段发射 + 既有采样日志的组合管线 hook（spec §5「并行分离」行）。
+
+        pyannote 事件映射（起点锚定，槽位序列在 decoding 之后为）：
+        - ("segmentation", completed=0) 分割批进度首事件 → segmenting（分割开始）
+        - ("embeddings", completed=0) → embedding（嵌入开始）
+        - ("embeddings", 阶段末尾，无 completed) → clustering（评审 R2A：聚类无
+          现成钩子，嵌入结束即聚类开始的管线缝隙补发）
+        - reconstructing 不走 hook：自研 BoundedSpeakerDiarization.reconstruct
+          起点直发（发射闭包经 _diarize_stage_emit 暂存，见 diarize()）
+        其余阶段（speaker_counting / discrete_diarization 等）不映射；批中进度
+        事件（completed>0）不发射。emit 为 None 时仅保留采样日志，无发射开销。
+        """
+        def hook(step_name, artefact, **kwargs):
+            self._log_pipeline_stage(step_name, artefact, **kwargs)
+            if emit is None:
+                return
+            stage = None
+            if "completed" in kwargs:
+                if kwargs.get("completed") == 0:
+                    stage = _PIPELINE_STAGE_START_BY_STEP.get(step_name)
+            elif step_name == "embeddings":
+                stage = "clustering"
+            if stage is not None:
+                emit(stage)
+        return hook
+
+    @staticmethod
     def _compact_turns(raw) -> list:
         """[(label, start, end), ...] → 紧凑编号的 SpeakerTurn 列表（按 label 首次出现顺序）"""
         label_to_id, turns = {}, []
@@ -461,7 +513,7 @@ class DiarizationManager:
                 logger.info("说话人分离管线已卸载")
                 return True
 
-    def diarize(self, samples: np.ndarray, sample_rate: int = 16000) -> List[SpeakerTurn]:
+    def diarize(self, samples: np.ndarray, sample_rate: int = 16000, stage_cb=None) -> List[SpeakerTurn]:
         # _load 在 _infer_lock 内:加载→推理构成同一锁保护的完整生命周期,
         # 与 unload(_infer_lock → _load_lock)无交错窗口
         with self._infer_lock:
@@ -470,13 +522,21 @@ class DiarizationManager:
             samples = _writable_samples(samples)
             waveform = torch.from_numpy(samples).unsqueeze(0)  # (1, T)
             audio = {"waveform": waveform, "sample_rate": sample_rate}
-            # max_speakers 恒传：自动模式约束 set_num_clusters 上界并截断 speaker
-            # count；显式 num_speakers 时被 pyannote 覆盖（__init__ 已拒绝超限）
-            kwargs = {"max_speakers": self.max_speakers,
-                      "hook": self._log_pipeline_stage}
-            if self.num_speakers > 0:
-                kwargs["num_speakers"] = self.num_speakers
-            diarization = self._pipeline(audio, **kwargs)
+            emit = self._stage_emit(stage_cb)
+            # reconstruct 无 hook 形参：发射闭包暂存到管线实例，供自研子类
+            # reconstruct 起点直发 reconstructing。_infer_lock 内单飞推理无交错，
+            # 用毕即清（finally），不留旧回调跨任务引用。
+            self._pipeline._diarize_stage_emit = emit
+            try:
+                # max_speakers 恒传：自动模式约束 set_num_clusters 上界并截断 speaker
+                # count；显式 num_speakers 时被 pyannote 覆盖（__init__ 已拒绝超限）
+                kwargs = {"max_speakers": self.max_speakers,
+                          "hook": self._stage_hook(emit)}
+                if self.num_speakers > 0:
+                    kwargs["num_speakers"] = self.num_speakers
+                diarization = self._pipeline(audio, **kwargs)
+            finally:
+                self._pipeline._diarize_stage_emit = None
         raw = [(label, turn.start, turn.end) for turn, _, label in diarization.itertracks(yield_label=True)]
         turns = self._compact_turns(raw)
         logger.info(f"说话人分离完成: {len(set(t.speaker for t in turns))} 人 / {len(turns)} turns")

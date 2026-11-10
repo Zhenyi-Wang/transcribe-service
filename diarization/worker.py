@@ -154,7 +154,12 @@ class DiarizationWorker:
                 return False
             return self._stop()
 
-    async def run(self, audio_path, timeout):
+    async def run(self, audio_path, timeout, stage_cb=None):
+        """分离一次音频；stage_cb(name) 接收五段阶段事件（decoding/segmenting/
+        embedding/clustering/reconstructing，spec §5 分离槽），供 JobManager 直写
+        diarize_stage（本层只透传）。契约与 progress_cb 一致：在事件循环内调用、
+        不得抛出异常；此处兜底吞异常，发射失败不中断分离。
+        """
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("分离超时必须是有限正数")
         if not self._job_lock.acquire(blocking=False):
@@ -196,6 +201,13 @@ class DiarizationWorker:
                     if event == "decoded":
                         logger.info("分离音频已解码: pid=%s duration=%.1fs pcm=%.1fMiB rss=%.0fMiB",
                                     self.pid, message["audio_duration"], message["pcm_mb"], rss)
+                    if event == "stage":
+                        name = message.get("name")
+                        if stage_cb is not None and name:
+                            try:
+                                stage_cb(name)
+                            except Exception:
+                                logger.debug("分离阶段回调失败", exc_info=True)
                 elif self._process.poll() is not None:
                     raise RuntimeError(f"分离工作进程意外退出: {self._process.returncode}")
                 await asyncio.sleep(0.05)
@@ -261,12 +273,23 @@ def _main(fd, parent_pid=None):
     connection = Connection(fd)
     manager = None
     connection.send({"event": "ready"})
+
+    def _emit_stage(name):
+        # 阶段事件尽力而为：Pipe 异常等发送失败只吞掉，不中断分离本身
+        # （结果/错误消息的发送失败仍走既有错误路径如实上报）。
+        try:
+            connection.send({"event": "stage", "name": name})
+        except Exception:
+            logger.debug("stage 事件发送失败", exc_info=True)
+
     try:
         while True:
             request = connection.recv()
             try:
                 if manager is None:
                     manager = DiarizationManager(**request["settings"])
+                # 解码段起点锚定（spec §5 五段之一；decoded 事件仍在解码完成后发）。
+                _emit_stage("decoding")
                 # 在加载模型前替换只读缓冲，让原 bytes/array 及时释放，避免长期双份 PCM。
                 samples = _writable_samples(load_audio(request["audio_path"]))
                 duration = len(samples) / 16000
@@ -275,7 +298,7 @@ def _main(fd, parent_pid=None):
                 with manager._infer_lock:
                     manager._load()
                 connection.send({"event": "loaded"})
-                turns = manager.diarize(samples)
+                turns = manager.diarize(samples, stage_cb=_emit_stage)
                 connection.send({"event": "result", "audio_duration": duration,
                                  "turns": [[t.start, t.end, t.speaker] for t in turns]})
                 del samples, turns
