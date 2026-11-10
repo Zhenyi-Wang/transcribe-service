@@ -84,10 +84,13 @@ class FunASRBackend(ASRBackend):
             except ImportError:
                 pass
 
-    def transcribe(self, audio_file: str, language: str = None, context: str = None) -> TranscribeResult:
+    def transcribe(self, audio_file: str, language: str = None, context: str = None,
+                   progress_cb=None, request_id: str = None) -> TranscribeResult:
         """执行转录
 
-        context 接受但不使用（引擎不支持 context 偏置）"""
+        context 接受但不使用（引擎不支持 context 偏置）；
+        progress_cb / request_id 接受但不使用（签名统一，spec §5：funasr 无细粒度
+        进度，phase-only；取消走 base no-op，能力恒 legacy）"""
         if not self._model:
             raise RuntimeError("模型未加载，请先调用 load()")
 

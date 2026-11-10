@@ -7,6 +7,7 @@ load/unload 空操作——client 不占本地 GPU，模型由 asr-engine 管理
 import json
 import logging
 import os
+import threading
 import time
 from typing import Optional
 
@@ -21,6 +22,11 @@ _logger = logging.getLogger(__name__)
 # 只重试连接拒绝类错误：ReadTimeout 可能请求已在处理，重试会重复转录。
 _CONNECT_RETRY_WAIT_SEC = 20.0
 _CONNECT_MAX_RETRIES = 2
+
+# 能力探测（spec §6 引擎侧第 3 条）：GET /v1/progress 404 → 负缓存 10min 后重探；
+# 200 → 正缓存持续（进程内）。瞬时错误不缓存，下次重探。
+_CAPABILITY_NEG_TTL_SEC = 600.0
+_CAPABILITY_PROBE_TIMEOUT_SEC = 5.0
 
 # OpenAI language 全名(小写) → transcribe-service 短代码（与 transcribe.py LANG_MAP 一致）
 _LANG_MAP = {
@@ -48,6 +54,10 @@ class ASREngineClientBackend(ASRBackend):
         self._url = config.asr_engine_url.rstrip("/")
         self._token = getattr(config, "asr_engine_token", "") or ""
         self._timeout = timeout
+        # capability 探测状态（probe_capability 持锁读写；探测罕见，锁内做短 HTTP 可接受）
+        self._cap_lock = threading.Lock()
+        self._cap_positive = False          # 探测到 /v1/progress → 进程内持续
+        self._cap_negative_until = None     # 404 负缓存到期时刻（time.monotonic() 值）
 
     @property
     def name(self) -> str:
@@ -63,7 +73,14 @@ class ASREngineClientBackend(ASRBackend):
     def unload(self) -> None:
         pass
 
-    def transcribe(self, audio_file: str, language: str = None, context: str = None) -> TranscribeResult:
+    def transcribe(self, audio_file: str, language: str = None, context: str = None,
+                   progress_cb=None, request_id: str = None) -> TranscribeResult:
+        """转发转录到 asr-engine。
+
+        progress_cb 接受但不使用（spec §5：asr-engine 进度经采样器轮询
+        GET /v1/progress，本地回调不承载）；request_id 有则随 form 上传，
+        供远端归属化取消与进度匹配（spec §6 引擎侧第 3 条）。
+        """
         # 流式上传：直接把打开的文件对象传给 httpx，避免 f.read() 全量读入内存。
         # try 包裹整个 with open + httpx.post，确保 f 在 post 完成前一直存活（with 作用域内）。
         payload = None
@@ -78,6 +95,8 @@ class ASREngineClientBackend(ASRBackend):
                     }
                     if context:
                         data["context"] = context
+                    if request_id:
+                        data["request_id"] = request_id
                     headers = {}
                     if self._token:
                         headers["Authorization"] = f"Bearer {self._token}"
@@ -141,5 +160,66 @@ class ASREngineClientBackend(ASRBackend):
             text=payload.get("text", ""),
             language=language,
             timestamps=timestamps,
-            performance={"audio_duration": payload.get("duration"), "processing_time": payload.get("processing_time")},
+            performance={
+                "audio_duration": payload.get("duration"),
+                "processing_time": payload.get("processing_time"),
+                # 远端引擎被归属化取消时顶层 "cancelled": true（引擎侧 format.py 已透出）；
+                # 消费方（队列取消探针）据此把该计算按已取消处理（spec §6 引擎侧第 6 条）
+                "cancelled": payload.get("cancelled") is True,
+            },
         )
+
+    def cancel_request(self, request_id: str) -> None:
+        """归属化取消（spec §6 引擎侧第 3 条）：POST /admin/cancel，scoped json body。
+
+        best-effort：传输失败或远端尚未部署该端点（404 等）记日志不抛——取消
+        失败的降级（标志+join）由消费方处理。legacy 态本方法照常发送（本后端
+        只经 probe_capability 如实报告能力，不自行吞请求）。
+        """
+        if not request_id:
+            return
+        headers = {}
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        try:
+            resp = httpx.post(f"{self._url}/admin/cancel", json={"request_id": request_id},
+                              headers=headers, timeout=10.0)
+            if resp.status_code >= 400:
+                _logger.warning("asr-engine 取消请求返回 %s（best-effort 忽略）", resp.status_code)
+        except httpx.HTTPError as e:
+            _logger.warning("asr-engine 取消请求失败（best-effort 忽略）: %s", e)
+
+    def probe_capability(self) -> str:
+        """探测远端引擎能力（spec §6 引擎侧第 3 条）：'progress+scoped' | 'legacy'。
+
+        首次 GET /v1/progress（带 token）：200 → 正缓存（进程内持续）；
+        404 → 负缓存 10min 后重探；其它（连接失败/5xx 等）→ legacy 且不缓存，
+        下次调用再探。legacy 态由消费方（JobManager）关 percent、取消降级
+        「标志+join」——本后端只如实报告。
+        """
+        if self._cap_positive:
+            return "progress+scoped"
+        with self._cap_lock:
+            if self._cap_positive:
+                return "progress+scoped"
+            now = time.monotonic()
+            if self._cap_negative_until is not None and now < self._cap_negative_until:
+                return "legacy"
+            headers = {}
+            if self._token:
+                headers["Authorization"] = f"Bearer {self._token}"
+            try:
+                resp = httpx.get(f"{self._url}/v1/progress", headers=headers,
+                                 timeout=_CAPABILITY_PROBE_TIMEOUT_SEC)
+            except httpx.HTTPError as e:
+                _logger.warning("asr-engine 能力探测失败（不缓存，下次重探）: %s", e)
+                return "legacy"
+            if resp.status_code == 200:
+                self._cap_positive = True
+                self._cap_negative_until = None
+                return "progress+scoped"
+            if resp.status_code == 404:
+                self._cap_negative_until = now + _CAPABILITY_NEG_TTL_SEC
+                return "legacy"
+            _logger.warning("asr-engine 能力探测异常状态 %s（不缓存，下次重探）", resp.status_code)
+            return "legacy"
