@@ -167,6 +167,27 @@ class Config:
         """CUDA EP cudnn_conv_algo_search 改写值（DEFAULT/HEURISTIC/EXHAUSTIVE，A/B 用）"""
         return self.get('diarization.cudnn_conv_algo_search', 'EXHAUSTIVE')
 
+    # ========== 任务队列配置（/jobs，JobManager 运行时经 config.get("jobs.*") 直读） ==========
+    @property
+    def jobs_max_queue(self) -> int:
+        """队列上限（含 running 与 cancelling）；满则 429 + Retry-After"""
+        return self.get('jobs.max_queue', 1000)
+
+    @property
+    def jobs_record_ttl_minutes(self) -> float:
+        """终态记录目标保留期（分钟）；预算压力可能提前整条驱逐（同 missing 语义）"""
+        return self.get('jobs.record_ttl_minutes', 60)
+
+    @property
+    def jobs_max_result_bytes(self) -> int:
+        """终态 result 总字节预算（默认 256MB），超限从最旧终态整条驱逐（单条超限保留）"""
+        return self.get('jobs.max_result_bytes', 268435456)
+
+    @property
+    def jobs_retry_after_seconds(self) -> int:
+        """队列满 429 的 Retry-After 秒数"""
+        return self.get('jobs.retry_after_seconds', 30)
+
     # ========== 服务器配置 ==========
     @property
     def idle_timeout(self) -> int:
