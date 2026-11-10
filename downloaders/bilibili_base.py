@@ -8,11 +8,12 @@ import time
 import threading
 import requests
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 
 from logger_config import setup_logger
 from cache_manager import cache_manager
 from .integrity import verify_audio_file
+from .base import DownloadCancelled
 
 logger = setup_logger('bilibili_base')
 
@@ -60,8 +61,19 @@ class BilibiliDownloaderBase:
 
     # ---------- 共享实现 ----------
 
-    def download_audio(self, audio_url: str, cookie: str, filename: str) -> Tuple[bool, str]:
-        """下载音频文件"""
+    def download_audio(self, audio_url: str, cookie: str, filename: str,
+                       progress_cb: Optional[Callable[[int, int], None]] = None,
+                       cancel_flag: Optional[threading.Event] = None) -> Tuple[bool, str]:
+        """下载音频文件
+
+        Args:
+            progress_cb: 进度回调 progress_cb(downloaded_bytes, total_bytes)，每写入一块
+                         触发一次；total 来自 content-length，不可得时不触发
+                         （percent 恒 null 语义，spec §5 downloading 行）
+            cancel_flag: 取消标志（threading.Event），置位后下一块边界抛
+                         DownloadCancelled（BaseException，穿透三处 except Exception，
+                         spec §4.3/§6）
+        """
         try:
             headers = self.headers_template.copy()
             headers["Cookie"] = cookie
@@ -86,9 +98,15 @@ class BilibiliDownloaderBase:
 
             with open(filename, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=block_size):
+                    # 每块边界查取消标志；DownloadCancelled 派生 BaseException，
+                    # 不会被本函数/重试循环/download() 外层的 except Exception 吞掉
+                    if cancel_flag is not None and cancel_flag.is_set():
+                        raise DownloadCancelled(f"下载已取消: {filename}")
                     if chunk:
                         f.write(chunk)
                         downloaded_size += len(chunk)
+                        if progress_cb is not None and total_size > 0:
+                            progress_cb(downloaded_size, total_size)
 
             # 完整性校验：实际字节数必须与 content-length 一致（连接中断时流会正常结束）
             if total_size > 0 and downloaded_size != total_size:
@@ -122,7 +140,9 @@ class BilibiliDownloaderBase:
             return audio_info
         return None
 
-    def download(self, id: str, cookie: str, save_dir: str = "tmp", page: int = 1) -> Tuple[bool, Union[str, dict]]:
+    def download(self, id: str, cookie: str, save_dir: str = "tmp", page: int = 1,
+                 progress_cb: Optional[Callable[[int, int], None]] = None,
+                 cancel_flag: Optional[threading.Event] = None) -> Tuple[bool, Union[str, dict]]:
         """下载B站音频的完整流程
 
         Args:
@@ -130,6 +150,9 @@ class BilibiliDownloaderBase:
             cookie: B站Cookie
             save_dir: 保存目录
             page: 分P页码（仅普通视频有效，番剧忽略）
+            progress_cb: 进度回调 progress_cb(downloaded_bytes, total_bytes)，转发至 download_audio
+            cancel_flag: 取消标志（threading.Event），置位后下载在块边界抛 DownloadCancelled
+                         （穿透重试循环与本函数外层 except Exception，由上层执行体处理）
 
         Returns:
             (success, result) - 成功时返回文件信息字典，失败时返回错误信息字符串
@@ -196,7 +219,9 @@ class BilibiliDownloaderBase:
                 else:
                     logger.info(f"音频ID: {audio_info['id']}, 比特率: {audio_info['bandwidth']/1000:.1f} kbps")
 
-                success, dl_result = self.download_audio(audio_url, cookie, part_path)
+                success, dl_result = self.download_audio(audio_url, cookie, part_path,
+                                                         progress_cb=progress_cb,
+                                                         cancel_flag=cancel_flag)
                 if not success:
                     last_error = f"下载失败: {dl_result}"
                     logger.warning(f"第 {attempt}/{MAX_DOWNLOAD_ATTEMPTS} 次{last_error}")

@@ -1,4 +1,19 @@
-from typing import Tuple, Union
+class DownloadCancelled(BaseException):
+    """下载段专用取消异常（job 队列取消，spec §4.3/§6）
+
+    派生自 BaseException：download_audio 内 except Exception、3 次重试循环、
+    download() 外层 except Exception 三处均天然放行，直达 JobManager 执行体
+    （命中 → 清理 tmp → cancelled）。
+
+    定义位置：必须在本模块顶部 import 语句之前——下方 import 级联导入
+    bilibili_video/bilibili_base，而 bilibili_base 需要 from .base import 本类，
+    类定义在导入之后会形成循环导入。
+    """
+
+
+from typing import Callable, Optional, Tuple, Union
+import threading
+
 from logger_config import setup_logger
 from .bilibili_video import BilibiliVideoDownloader
 from .bilibili_episode import BilibiliEpisodeDownloader
@@ -39,7 +54,9 @@ class Downloader:
 
         return 'unknown', id
 
-    def download(self, id: str, cookie: str, save_dir: str = "tmp", page: int = 1) -> Tuple[bool, Union[str, dict]]:
+    def download(self, id: str, cookie: str, save_dir: str = "tmp", page: int = 1,
+                 progress_cb: Optional[Callable[[int, int], None]] = None,
+                 cancel_flag: Optional[threading.Event] = None) -> Tuple[bool, Union[str, dict]]:
         """根据ID类型下载音频
 
         Args:
@@ -47,6 +64,9 @@ class Downloader:
             cookie: B站Cookie
             save_dir: 保存目录
             page: 分P页码（仅 bvid 格式生效，默认 1）
+            progress_cb: 进度回调 progress_cb(downloaded_bytes, total_bytes)，
+                         total 来自 content-length（spec §5 downloading 行）
+            cancel_flag: 取消标志（threading.Event），置位后下载在下一块边界抛 DownloadCancelled
 
         Returns:
             (success, result) - 成功时返回文件信息字典，失败时返回错误信息字符串
@@ -60,9 +80,11 @@ class Downloader:
         logger.info(f"检测到ID类型: {id_type}, 原始ID: {id}")
 
         if id_type == 'bvid':
-            return self.video_downloader.download(pure_id, cookie, save_dir, page=page)
+            return self.video_downloader.download(pure_id, cookie, save_dir, page=page,
+                                                  progress_cb=progress_cb, cancel_flag=cancel_flag)
         elif id_type == 'ep':
-            return self.episode_downloader.download(pure_id, cookie, save_dir)
+            return self.episode_downloader.download(pure_id, cookie, save_dir,
+                                                    progress_cb=progress_cb, cancel_flag=cancel_flag)
         else:
             logger.error(f"无法识别的ID格式: {id}")
             return False, f"无法识别的ID格式: {id}，支持的格式: bvid (BV...) 或 ep (ep2289525)"
@@ -75,9 +97,12 @@ class BilibiliDownloader(Downloader):
     Deprecated: 建议直接使用 Downloader 类
     """
 
-    def download_bilibili_audio(self, bvid: str, cookie: str, save_dir: str = "tmp", page: int = 1) -> Tuple[bool, Union[str, dict]]:
+    def download_bilibili_audio(self, bvid: str, cookie: str, save_dir: str = "tmp", page: int = 1,
+                                progress_cb: Optional[Callable[[int, int], None]] = None,
+                                cancel_flag: Optional[threading.Event] = None) -> Tuple[bool, Union[str, dict]]:
         """下载B站音频的完整流程（向后兼容方法）
 
         Deprecated: 建议使用 download() 方法
         """
-        return self.download(bvid, cookie, save_dir, page=page)
+        return self.download(bvid, cookie, save_dir, page=page,
+                             progress_cb=progress_cb, cancel_flag=cancel_flag)

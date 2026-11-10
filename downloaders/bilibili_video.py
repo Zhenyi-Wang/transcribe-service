@@ -1,6 +1,7 @@
 import json
 import re
-from typing import Optional, Tuple, Union
+import threading
+from typing import Callable, Optional, Tuple, Union
 
 import requests
 
@@ -122,6 +123,9 @@ class BilibiliVideoDownloader(BilibiliDownloaderBase):
     def _audio_filename(self, id: str, page: int, audio_info: dict, ext: str) -> str:
         return f"{id}_p{page}_audio_{audio_info['id']}{ext}"
 
-    def download(self, id: str, cookie: str, save_dir: str = "tmp", page: int = 1) -> Tuple[bool, Union[str, dict]]:
-        """下载B站视频音频（透传 page，其余流程见基类）"""
-        return super().download(id, cookie, save_dir, page=page)
+    def download(self, id: str, cookie: str, save_dir: str = "tmp", page: int = 1,
+                 progress_cb: Optional[Callable[[int, int], None]] = None,
+                 cancel_flag: Optional[threading.Event] = None) -> Tuple[bool, Union[str, dict]]:
+        """下载B站视频音频（透传 page 与进度/取消参数，其余流程见基类）"""
+        return super().download(id, cookie, save_dir, page=page,
+                                progress_cb=progress_cb, cancel_flag=cancel_flag)
