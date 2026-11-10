@@ -8,7 +8,7 @@ import dataclasses
 import numpy as np
 import multiprocessing as mp
 from collections import Counter, deque
-from typing import Optional, List
+from typing import Optional, List, Callable
 
 from .schema import MsgType, StreamingMessage, DecodeResult, ASREngineConfig, TranscribeResult, ForcedAlignItem, ForcedAlignResult
 from .utils import normalize_language_name, validate_language
@@ -394,19 +394,23 @@ class QwenASREngine:
         print(f"  🔹 LLM 生成    : {stats['decode_time']:.3f} 秒 ({stats['decode_tokens']} tokens, {gen_speed:.1f} tokens/s)")
 
     def transcribe(
-        self, 
-        audio_file: str, 
-        language: Optional[str] = None, 
-        context: Optional[str] = None, 
+        self,
+        audio_file: str,
+        language: Optional[str] = None,
+        context: Optional[str] = None,
         start_second: float = 0.0,
         duration: float = 0.0,
         temperature: float = 0.4,
-        rollback_num: int = 5
+        rollback_num: int = 5,
+        progress_cb: Optional[Callable[[int, int], None]] = None
     ) -> TranscribeResult:
-        """运行完整转录流水线 (从文件加载音频)"""
+        """运行完整转录流水线 (从文件加载音频)
+
+        progress_cb: 可选进度回调，每完成一个 chunk 调用一次 progress_cb(done, total)。
+        """
         from .audio import load_audio
         audio = load_audio(audio_file, start_second=start_second if start_second > 0 else None, duration=duration if duration > 0 else None)
-        
+
         return self.asr(
             audio=audio,
             context=context or "",
@@ -414,7 +418,8 @@ class QwenASREngine:
             chunk_size_sec=self.config.chunk_size,
             memory_chunks=self.config.memory_num,
             temperature=temperature,
-            rollback_num=rollback_num
+            rollback_num=rollback_num,
+            progress_cb=progress_cb
         )
 
     def asr(
@@ -425,7 +430,8 @@ class QwenASREngine:
         chunk_size_sec: float = 40.0,
         memory_chunks: int = 2,
         temperature: float = 0.4,
-        rollback_num: int = 5
+        rollback_num: int = 5,
+        progress_cb: Optional[Callable[[int, int], None]] = None
     ) -> TranscribeResult:
         """运行完整转录流水线 (三级流水线：i+1 预取, i 识别, i-1 对齐)
 
@@ -563,6 +569,10 @@ class QwenASREngine:
                 all_segments[i].items = align_res.items
                 all_aligned_items.extend(align_res.items)
                 stats["align_time"] += (time.time() - t_align_start)
+
+            # 进度回调：每完成一个 chunk 调用一次（done 为顺序值，取消 break 时不触发）
+            if progress_cb:
+                progress_cb(i + 1, num_chunks)
 
         # 4. 结果整理
         all_aligned_items.sort(key=lambda x: x.start_time)
