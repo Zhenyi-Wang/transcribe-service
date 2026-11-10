@@ -7,7 +7,7 @@ import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Annotated, List, Literal, Optional, Union
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -17,12 +17,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import config
 from downloaders import BilibiliDownloader
 from downloaders import DouyinDownloader
+from downloaders.base import DownloadCancelled
 from transcribe import TranscriptionService, diarize_only, diarize_merge_subtitle
 from backends.asr_engine_backend import UpstreamPausedError
 from logger_config import setup_logger
 from cache_manager import cache_manager
 from pause_manager import PauseManager, MAX_PAUSE_HOURS
 from diarization import worker as diarization_mgr
+from jobs import JobManager, QueueFullError
 import webdav_archive
 from pydantic import BaseModel, Field
 
@@ -90,20 +92,21 @@ class ModelManager:
             return self._backend.name
         return config.backend_name
 
+_ALLOWED_AUDIO_EXTS = {'.wav', '.mp3', '.m4a', '.flac', '.aac', '.ogg', '.wma'}
+
+
+def _safe_audio_ext(filename: str) -> str:
+    """扩展名白名单（与 generate_safe_filename 同源）；缺失/非法 → .tmp"""
+    ext = Path(filename or "").suffix.lower()
+    return ext if ext in _ALLOWED_AUDIO_EXTS else '.tmp'
+
+
 def generate_safe_filename(filename: str) -> str:
     """生成安全的临时文件名"""
     if not filename:
         filename = "audio"
 
-    # 获取文件扩展名
-    ext = Path(filename).suffix.lower()
-    if not ext:
-        ext = ".tmp"  # 默认扩展名
-
-    # 限制扩展名到常见音频格式
-    allowed_exts = {'.wav', '.mp3', '.m4a', '.flac', '.aac', '.ogg', '.wma'}
-    if ext not in allowed_exts:
-        ext = '.tmp'
+    ext = _safe_audio_ext(filename)
 
     # 使用UUID + 时间戳确保唯一性
     unique_id = str(uuid.uuid4())[:8]
@@ -118,14 +121,38 @@ def get_temp_dir():
     return temp_dir
 
 
-def cleanup_stale_tmp_files(max_age_hours: int = 24):
-    """清理超过指定时间的 tmp 文件"""
+def cleanup_stale_tmp_files(max_age_hours: int = 24, protected: Optional[set] = None):
+    """清理超过指定时间的 tmp 文件（jobs 队列活跃感知，spec §6 终态清理）。
+
+    protected：JobManager 活跃 upload 登记路径集——命中即跳过；其 `.job-*`
+    硬链接别名（_audio_lease 派生，继承旧 mtime）经 inode 匹配同步豁免（评审 R3）。
+    未登记的超龄 `.job-*` 残留（原文件已消亡的孤儿别名）照常按 24h 兜底清理
+    （评审 R2A 修正措辞：无条件跳过与 24h 兜底矛盾，故按 inode 归属豁免）。
+    """
     temp_dir = Path("tmp")
     if not temp_dir.exists():
         return
     cutoff = time.time() - max_age_hours * 3600
+    protected_abs = {os.path.abspath(str(p)) for p in protected} if protected else set()
+    protected_inodes = set()
+    for p in protected_abs:
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        protected_inodes.add((st.st_dev, st.st_ino))
     for f in temp_dir.iterdir():
-        if f.is_file() and f.stat().st_mtime < cutoff:
+        if not f.is_file():
+            continue
+        if os.path.abspath(str(f)) in protected_abs:
+            continue
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        if (st.st_dev, st.st_ino) in protected_inodes:
+            continue  # 活跃 upload 的硬链接别名（原路径已豁免，别名继承旧 mtime）
+        if st.st_mtime < cutoff:
             try:
                 f.unlink()
                 logger.info(f"清理过期临时文件: {f.name}")
@@ -140,13 +167,381 @@ transcription_service = TranscriptionService(manager)
 # ================= 暂停管理单例 =================
 pause_manager = PauseManager(notify_url=config.pause_notify_url,
                              notify_token=config.pause_notify_token)
-PAUSED_REJECT_PATHS = {"/transcribe", "/transcribe_url", "/transcribe_file", "/transcribe_douyin"}
+PAUSED_REJECT_PATHS = {"/transcribe", "/transcribe_url", "/transcribe_file", "/transcribe_douyin",
+                       "/jobs", "/jobs/upload"}
 
 
 def _fmt_resume_at(resume_at):
     if resume_at is None:
         return "未知"
     return f"{resume_at:%H:%M}" if resume_at.date() == datetime.now().date() else f"{resume_at:%m-%d %H:%M}"
+
+
+# ================= 任务队列（spec §6 执行模型：装配 + 真实执行体工厂） =================
+
+job_manager = JobManager(config)
+
+# asr-engine 暂停态非阻塞快照（worker 取件门消费；后台周期刷新）
+_asr_paused_snapshot = {"paused": False, "checked_at": 0.0}
+UPSTREAM_PAUSE_REFRESH_SECONDS = 60.0
+QUERY_BATCH_LIMIT = 500
+
+# httpx AsyncClient 惰性共享（采样器 ~1s 一发；shutdown 关闭）
+_progress_http_client = None
+
+# startup 拉起的队列辅助后台任务（shutdown 取消）
+_jobs_bg_tasks = []
+
+
+def _upstream_pause_snapshot() -> bool:
+    """`_upstream_pause_probe` 注入实现：读缓存快照，绝不阻塞事件循环。
+
+    `_query_asr_paused` 是 3s 同步 get，直接绑定会卡死 worker 取件门与自冷
+    轮询（jobs.py 注入点契约）；真实查询由 `_upstream_pause_refresh_loop`
+    经 to_thread 周期刷新（60s 间隔，启动即首查）。"""
+    return bool(_asr_paused_snapshot["paused"])
+
+
+async def _upstream_pause_refresh_loop():
+    while True:
+        try:
+            paused = await asyncio.to_thread(_query_asr_paused)
+            _asr_paused_snapshot["paused"] = bool(paused)
+            _asr_paused_snapshot["checked_at"] = time.time()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"asr-engine 暂停态快照刷新失败(保留旧值): {e}")
+        await asyncio.sleep(UPSTREAM_PAUSE_REFRESH_SECONDS)
+
+
+async def _poll_asr_engine_progress(job, request_id) -> Optional[dict]:
+    """`_progress_poll` 注入实现：asr-engine GET /v1/progress（带 timeout + token）。
+
+    任何失败（网络/非 200/解析）返回 None——采样器本轮忽略（spec §5：
+    inactive/不匹配/失败 → 本轮忽略）；鉴权用 config.asr_engine_token。"""
+    global _progress_http_client
+    try:
+        import httpx
+        if _progress_http_client is None:
+            _progress_http_client = httpx.AsyncClient(timeout=2.0)
+        headers = None
+        token = config.asr_engine_token
+        if token:
+            headers = {"Authorization": f"Bearer {token}"}
+        resp = await _progress_http_client.get(
+            f"{config.asr_engine_url.rstrip('/')}/v1/progress", headers=headers)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+async def _close_progress_client():
+    global _progress_http_client
+    if _progress_http_client is not None:
+        try:
+            await _progress_http_client.aclose()
+        except Exception:
+            pass
+        _progress_http_client = None
+
+
+async def _warm_capability_once():
+    """`_capability` 预热：启动后台探测一次 backend capability（Task 5 正/负缓存），
+    首个任务即得真实能力；backend 未加载时静默跳过（懒加载路径由 _capability
+    调用点兜底）。"""
+    try:
+        backend = manager._backend
+        if backend is not None:
+            await asyncio.to_thread(backend.probe_capability)
+    except Exception as e:
+        logger.info(f"capability 预热跳过(不影响功能): {e}")
+
+
+def _unlink_quiet(path) -> None:
+    """尽力删除（OSError 静默）——上传暂存失败/被拒提交的清理。"""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _job_error_dict(message: str) -> dict:
+    """与现有端点错误响应同构的错误 dict（JobManager 终态映射：status==error → job error）。"""
+    return {"status": "error", "message": message,
+            "type": config.subtitle_config["type"],
+            "version": config.subtitle_config["version"],
+            "body": [], "rtf": 0.0}
+
+
+def _delete_tmp_artifact(path) -> None:
+    """队列执行体产物清理：仅删 tmp 下的文件；缓存目录文件保留（与遗留端点一致）。"""
+    if not path or not os.path.exists(path):
+        return
+    if path.startswith("tmp/") or "/tmp/" in path:
+        try:
+            os.remove(path)
+            logger.info(f"队列任务临时文件已删除: {path}")
+        except OSError as e:
+            logger.warning(f"队列任务临时文件删除失败 {path}: {e}")
+
+
+def _cleanup_part_files(video_id: str, save_dir: str) -> None:
+    """DownloadCancelled 后清理半截 .part 文件（spec §6：命中 → 清理 tmp → cancelled）。"""
+    try:
+        for f in Path(save_dir).glob(f"*{video_id}*.part*"):
+            try:
+                f.unlink()
+                logger.info(f"已清理未完成下载: {f.name}")
+            except OSError:
+                pass
+    except Exception as e:
+        logger.warning(f".part 清理失败(忽略): {e}")
+
+
+async def _exec_bilibili(job, sinks, req):
+    """B 站执行体：下载(to_thread + 进度/取消) → diarize_only 变体 / process_transcription。
+
+    下载段进度经 sinks["progress"] 写转录槽（downloading 段 percent 为 B 站真实值）；
+    成功后 note_download_time → JobManager 终态映射注入 timing.download；
+    DownloadCancelled → 清 .part → 上抛（终态 cancelled 由 JobManager 映射）。"""
+    video_id = req.get("bvid") or ""
+    cookie = req.get("cookie") or ""
+    page = int(req.get("page") or 1)
+    context = req.get("context")
+    diarize = bool(req.get("diarize"))
+    no_cache = bool(req.get("no_cache"))
+    save_dir = str(get_temp_dir())
+
+    sinks["phase"]("downloading")
+    download_start = time.time()
+    try:
+        success, dl = await asyncio.to_thread(
+            downloader.download_bilibili_audio, video_id, cookie, save_dir, page,
+            progress_cb=sinks["progress"], cancel_flag=sinks["cancel_event"])
+    except DownloadCancelled:
+        _cleanup_part_files(video_id, save_dir)
+        raise
+    download_time = time.time() - download_start
+    sinks["note_download_time"](download_time)
+
+    if not success:
+        return _job_error_dict(f"音频下载失败: {dl}")
+
+    temp_filename = dl["file_path"]
+    try:
+        if sinks["cancelled"]():     # 下载完成后取消检查（sinks 契约）
+            raise DownloadCancelled(f"下载完成后已取消: {video_id}")
+
+        if req.get("diarize_only"):
+            # diarize_only 无 transcribing 段：downloading → formatting → done，
+            # percent 恒 null（spec §4.2）
+            sinks["phase"]("formatting")
+            if req.get("body"):
+                return await diarize_merge_subtitle(
+                    req.get("body"), temp_filename, video_id, download_time,
+                    wait_deadline=sinks["diarize_wait_deadline"], stage_cb=sinks["stage"])
+            return await diarize_only(
+                temp_filename, video_id, download_time,
+                wait_deadline=sinks["diarize_wait_deadline"], stage_cb=sinks["stage"])
+
+        display_name = f"Bilibili_{video_id}_p{page}" if page > 1 else f"Bilibili_{video_id}"
+        cache_video_id = f"{video_id}_p{page}" if page > 1 else video_id
+        audio_url = dl.get("audio_url")
+        audio_id = dl.get("audio_id")
+        sinks["phase"]("transcribing")
+        # inflight_key 与下方 process_transcription 完全同参构建（取消联动依赖）
+        key = transcription_service.build_inflight_key(
+            temp_filename, audio_url=audio_url, bvid=cache_video_id, audio_id=audio_id,
+            context=context, diarize=diarize, no_cache=no_cache)
+        sinks["set_inflight_key"](key)
+        return await transcription_service.process_transcription(
+            temp_filename, display_name, audio_url, cache_video_id, audio_id, no_cache,
+            context=context, diarize=diarize,
+            progress_cb=sinks["progress"], cancelled=sinks["cancelled"],
+            diarize_wait_deadline=sinks["diarize_wait_deadline"], stage_cb=sinks["stage"],
+            phase_cb=_phase_sink_cb(sinks))
+    finally:
+        _delete_tmp_artifact(temp_filename)
+
+
+def _phase_sink_cb(sinks):
+    """process_transcription 的 phase_cb 装配（fixwave F4，spec §5）：
+    formatting → percent 直接 100；其余 phase 不带 percent。
+    （diarize_only 变体不经此：其 percent 恒 null，直接 sinks["phase"]("formatting")。）"""
+    def _cb(name):
+        sinks["phase"](name, 100 if name == "formatting" else None)
+    return _cb
+
+
+async def _exec_webdav(job, sinks, req):
+    """网盘执行体：路径解析 + inbox→processed 回退 → process_transcription
+    → 成功归档（取消/失败不归档，spec §6）。
+
+    归档与取消竞态（fixwave F3）：归档前查 job 取消标志（sinks["cancelled"] 探针），
+    已取消 → 跳过归档；归档一旦开始即为提交点（job.commit_done）——取消在其后
+    到达时 done 胜出取消（JobManager 按提交点落态，result 与已归档文件一致）。
+    """
+    path = req.get("path") or ""
+    context = req.get("context")
+    diarize = bool(req.get("diarize"))
+    no_cache = bool(req.get("no_cache"))
+    webdav_base = config.get('webdav.base_path', '/mnt/webdav')
+    relative_path = path.lstrip('/')
+    full_file_path = os.path.join(webdav_base, relative_path)
+
+    logger.info(f"队列网盘文件转录: {path} -> {full_file_path}")
+    if not os.path.exists(full_file_path):
+        if relative_path.startswith('inbox/'):
+            fallback_path = 'processed/' + relative_path[len('inbox/'):]
+            fallback_full_path = os.path.join(webdav_base, fallback_path)
+            logger.info(f"inbox 文件不存在，尝试 processed 回退: {fallback_full_path}")
+            if os.path.exists(fallback_full_path):
+                relative_path = fallback_path
+                full_file_path = fallback_full_path
+    if not os.path.exists(full_file_path):
+        return _job_error_dict(f"文件不存在: {path}")
+    if not os.path.isfile(full_file_path):
+        return _job_error_dict(f"路径不是文件: {path}")
+    if not os.access(full_file_path, os.R_OK):
+        return _job_error_dict(f"文件不可读: {path}")
+
+    sinks["phase"]("transcribing")
+    try:
+        key = transcription_service.build_inflight_key(
+            full_file_path, file_path_for_cache=full_file_path,
+            context=context, diarize=diarize, no_cache=no_cache)
+        sinks["set_inflight_key"](key)
+        result = await transcription_service.process_transcription(
+            full_file_path, path, audio_url=None, bvid=None, audio_id=None,
+            no_cache=no_cache, file_path_for_cache=full_file_path,
+            context=context, diarize=diarize,
+            progress_cb=sinks["progress"], cancelled=sinks["cancelled"],
+            diarize_wait_deadline=sinks["diarize_wait_deadline"], stage_cb=sinks["stage"],
+            phase_cb=_phase_sink_cb(sinks))
+
+        # 归档仅在成功路径执行：取消（JobCancelledError/CancelledError 上抛穿透）
+        # 与失败（status==error）都不归档（评审 Review Focus #2）；归档开始前
+        # 查取消标志（fixwave F3），置位即跳过
+        if isinstance(result, dict) and result.get("status") != "error":
+            if sinks["cancelled"]():
+                logger.info(f"任务已取消，跳过归档: {relative_path}")
+            else:
+                job.commit_done = True   # 提交点：归档开始后 done 胜出取消（F3）
+                await asyncio.to_thread(webdav_archive.move_to_processed,
+                                        webdav_base, relative_path)
+        return result
+    except UpstreamPausedError:
+        raise   # 暂停信号穿透（JobManager 映射 error + paused/resume_at/paused_at）
+    except Exception as e:
+        logger.error(f"队列网盘文件转录失败: {e}")
+        return _job_error_dict(str(e))
+
+
+async def _exec_douyin(job, sinks, req):
+    """抖音执行体：to_thread 下载（ffmpeg 无逐块取消点 → 标志 + join 自然结束）
+    → process_transcription。"""
+    aweme_id = req.get("aweme_id") or ""
+    context = req.get("context")
+    diarize = bool(req.get("diarize"))
+    no_cache = bool(req.get("no_cache"))
+
+    sinks["phase"]("downloading")
+    download_start = time.time()
+    success, dl = await asyncio.to_thread(
+        downloader_douyin.download_douyin_audio, aweme_id,
+        save_dir=str(get_temp_dir()))
+    download_time = time.time() - download_start
+    sinks["note_download_time"](download_time)
+
+    if not success:
+        return _job_error_dict(f"音频下载失败: {dl}")
+
+    temp_filename = dl["file_path"]
+    try:
+        if sinks["cancelled"]():
+            raise DownloadCancelled(f"下载完成后已取消: {aweme_id}")
+        audio_url = dl.get("audio_url")
+        audio_id = dl.get("audio_id")
+        sinks["phase"]("transcribing")
+        key = transcription_service.build_inflight_key(
+            temp_filename, audio_url=audio_url, bvid=aweme_id, audio_id=audio_id,
+            context=context, diarize=diarize, no_cache=no_cache)
+        sinks["set_inflight_key"](key)
+        return await transcription_service.process_transcription(
+            temp_filename, f"Douyin_{aweme_id}", audio_url, aweme_id, audio_id, no_cache,
+            context=context, diarize=diarize,
+            progress_cb=sinks["progress"], cancelled=sinks["cancelled"],
+            diarize_wait_deadline=sinks["diarize_wait_deadline"], stage_cb=sinks["stage"],
+            phase_cb=_phase_sink_cb(sinks))
+    finally:
+        _delete_tmp_artifact(temp_filename)
+
+
+async def _exec_upload(job, sinks, req):
+    """上传执行体：内部键路径（tmp/jobfile_*）→ process_transcription；
+    文件删除归 JobManager 终态清理（_mark_finished），此处不删。"""
+    path = job.upload_path
+    context = req.get("context")
+    diarize = bool(req.get("diarize"))
+    sinks["phase"]("transcribing")
+    # upload 无稳定 identity：identity = abspath(内部键)（唯一 tmp 名，天然不与他人合并）
+    key = transcription_service.build_inflight_key(
+        path, context=context, diarize=diarize, no_cache=False)
+    sinks["set_inflight_key"](key)
+    return await transcription_service.process_transcription(
+        path, req.get("original_filename") or Path(path).name,
+        diarize=diarize, context=context,
+        progress_cb=sinks["progress"], cancelled=sinks["cancelled"],
+        diarize_wait_deadline=sinks["diarize_wait_deadline"], stage_cb=sinks["stage"],
+        phase_cb=_phase_sink_cb(sinks))
+
+
+async def _make_executor(job, sinks):
+    """JobManager._executor_factory 注入（spec §6 执行模型末段）：按 source 分派。"""
+    req = job.request or {}
+    # 回填 backend name（采样器归属依赖：asr-engine → GET /v1/progress 远端采样；
+    # 懒加载窗口取 config.backend_name，与其后真实加载的后端一致）
+    sinks["set_backend_name"](manager.backend)
+    if job.source == "bilibili":
+        return await _exec_bilibili(job, sinks, req)
+    if job.source == "webdav":
+        return await _exec_webdav(job, sinks, req)
+    if job.source == "douyin":
+        return await _exec_douyin(job, sinks, req)
+    if job.source == "upload":
+        return await _exec_upload(job, sinks, req)
+    raise ValueError(f"未知任务来源: {job.source}")
+
+
+def _setup_job_manager(jm=None):
+    """JobManager 六注入点装配（幂等；模块导入与测试隔离共同入口）。
+
+    注入函数以闭包引用 server 模块全局（运行时解析）——monkeypatch
+    pause_manager/manager/downloader 等后无需重装配。
+    直接反向 import server 会成环，故 jobs.py 侧全部走注入点（评审 R5A）。"""
+    mgr = jm if jm is not None else job_manager
+    mgr._executor_factory = _make_executor
+    mgr._cancel_computation = transcription_service.cancel_computation
+    mgr._entry_lookup = transcription_service._inflight.get
+    mgr._backend_lookup = lambda: manager._backend
+    mgr._pause_gate = lambda: pause_manager.is_paused()
+    mgr._upstream_pause_probe = _upstream_pause_snapshot
+    mgr._progress_poll = _poll_asr_engine_progress
+    return mgr
+
+
+_setup_job_manager()
+
+
+def _queue_full_response(e: QueueFullError) -> JSONResponse:
+    """429：Retry-After 响应头与 body 字段双写（spec §4.1，评审 R1A fold）。"""
+    return JSONResponse(status_code=429,
+                        content={"detail": e.detail, "retry_after": e.retry_after},
+                        headers={"Retry-After": str(e.retry_after)})
 
 
 def _parse_iso_dt(value):
@@ -308,6 +703,10 @@ async def startup_event():
     """应用启动时的事件处理"""
     logger.info("服务启动中...")
     cache_manager.cleanup_expired_cache()
+    # 任务队列拉起（worker/采样器/清扫，幂等）+ 辅助后台任务
+    await job_manager.start()
+    _jobs_bg_tasks.append(asyncio.create_task(_upstream_pause_refresh_loop()))
+    _jobs_bg_tasks.append(asyncio.create_task(_warm_capability_once()))
     if pause_manager.is_paused():
         logger.info(f"启动时处于暂停状态(至 {_fmt_resume_at(pause_manager.resume_at())})，跳过预加载")
         return
@@ -321,6 +720,19 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    # 先收尾队列（running 任务走取消语义 join 完成后，才释放分离/模型资源）
+    await job_manager.stop()
+    for t in _jobs_bg_tasks:
+        t.cancel()
+    for t in _jobs_bg_tasks:
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.warning("队列辅助后台任务停止异常", exc_info=True)
+    _jobs_bg_tasks.clear()
+    await _close_progress_client()
     await asyncio.to_thread(diarization_mgr.unload_global)
 
 
@@ -391,7 +803,7 @@ async def transcribe_audio(file: UploadFile = File(...), diarize: bool = Form(Fa
                 os.remove(temp_filename)
         except Exception as e:
             logger.warning(f"警告：临时文件删除失败 {temp_filename}: {e}")
-        cleanup_stale_tmp_files()
+        cleanup_stale_tmp_files(protected=job_manager.active_upload_paths())
 
 @app.post("/transcribe_url")
 async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
@@ -460,7 +872,7 @@ async def transcribe_bilibili_audio(request: BilibiliTranscribeRequest):
                     logger.warning(f"警告：临时文件删除失败 {temp_filename}: {e}")
             else:
                 logger.info(f"缓存文件保留: {temp_filename}")
-        cleanup_stale_tmp_files()
+        cleanup_stale_tmp_files(protected=job_manager.active_upload_paths())
 
 
 @app.post("/transcribe_file")
@@ -600,7 +1012,134 @@ async def transcribe_douyin_audio(request: DouyinTranscribeRequest):
                     logger.warning(f"临时文件删除失败: {temp_filename}: {e}")
             else:
                 logger.info(f"缓存文件保留: {temp_filename}")
-        cleanup_stale_tmp_files()
+        cleanup_stale_tmp_files(protected=job_manager.active_upload_paths())
+
+
+# ================= /jobs 异步任务端点（spec §4 API 契约） =================
+
+class JobBilibiliSubmit(BaseModel):
+    """字段校验与 BilibiliTranscribeRequest 同构 + 判别标签 + 可选 job_id"""
+    source: Literal["bilibili"]
+    bvid: str
+    cookie: str
+    page: int = 1
+    context: Optional[str] = None  # ASR 偏置文本，可选
+    diarize: bool = False
+    diarize_only: bool = False
+    body: Optional[List[dict]] = None  # diarize_only=true 时的官方字幕 body
+    no_cache: bool = False
+    job_id: Optional[str] = None  # 客户端幂等键（服务端不透明，格式不合法 → 422）
+
+
+class JobWebdavSubmit(BaseModel):
+    source: Literal["webdav"]
+    path: str
+    context: Optional[str] = None
+    diarize: bool = False
+    no_cache: bool = False
+    job_id: Optional[str] = None
+
+
+class JobDouyinSubmit(BaseModel):
+    source: Literal["douyin"]
+    aweme_id: str = Field(..., pattern=r"^\d{15,20}$")  # 与 DouyinTranscribeRequest 同构
+    context: Optional[str] = None
+    diarize: bool = False
+    no_cache: bool = False
+    job_id: Optional[str] = None
+
+
+JobSubmitRequest = Annotated[Union[JobBilibiliSubmit, JobWebdavSubmit, JobDouyinSubmit],
+                             Field(discriminator="source")]
+
+
+class JobQueryRequest(BaseModel):
+    ids: List[str]
+
+
+@app.post("/jobs")
+async def submit_job(request: JobSubmitRequest):
+    """统一异步任务入口（spec §4.1）：202 新任务 / 200 重放+dedup /
+    429 队列满（Retry-After 头+body 双写）/ 422 校验失败。
+    暂停中由中间件 503（PAUSED_REJECT_PATHS 含 /jobs）。"""
+    job_id = request.job_id
+    params = request.model_dump(exclude={"source", "job_id"})
+    try:
+        out = await job_manager.submit(request.source, params, job_id=job_id)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except QueueFullError as e:
+        return _queue_full_response(e)
+    return JSONResponse(status_code=(200 if out.get("dedup") else 202), content=out)
+
+
+@app.post("/jobs/upload")
+async def submit_upload_job(file: UploadFile = File(...),
+                            diarize: bool = Form(False),
+                            context: Optional[str] = Form(None),
+                            job_id: Optional[str] = Form(None)):
+    """上传转录任务（multipart，spec §4.1）：文件落盘内部键 tmp/jobfile_{uuid}{ext}
+    （job_id 永不进文件名；ext 沿用 generate_safe_filename 白名单）。
+    同 id 重放：200 + dedup，新上传文件立即删除。"""
+    temp_dir = get_temp_dir()
+    internal_path = temp_dir / f"jobfile_{uuid.uuid4().hex}{_safe_audio_ext(file.filename)}"
+    try:
+        with open(internal_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception:
+        _unlink_quiet(internal_path)
+        raise
+
+    params = {"diarize": diarize, "context": context or None,
+              "original_filename": file.filename}
+    try:
+        out = await job_manager.submit("upload", params, job_id=job_id,
+                                       upload_tmp_path=str(internal_path))
+    except ValueError as e:
+        _unlink_quiet(internal_path)   # 提交被拒：文件无人接管，就地删除
+        raise HTTPException(status_code=422, detail=str(e))
+    except QueueFullError as e:
+        _unlink_quiet(internal_path)
+        return _queue_full_response(e)
+    return JSONResponse(status_code=(200 if out.get("dedup") else 202), content=out)
+
+
+@app.post("/jobs/query")
+async def query_jobs(request: JobQueryRequest):
+    """批量查询（spec §4.2）：单次上限 500，静默截断——超出部分按 missing 返回
+    （评审 R5A 定死语义，与终态驱逐同语义：missing = attempt+1 重提）。"""
+    ids = request.ids or []
+    batch, overflow = ids[:QUERY_BATCH_LIMIT], ids[QUERY_BATCH_LIMIT:]
+    out = job_manager.query(batch)
+    out["missing"] = list(out["missing"]) + list(overflow)
+    return out
+
+
+@app.get("/jobs")
+async def list_jobs(status: Optional[str] = None):
+    """任务列表（调试/对账用，spec §4.2）：?status= 过滤，倒序，cap 只作用于终态。"""
+    return job_manager.list_jobs(status)
+
+
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str):
+    """单任务查询（spec §4.2 完整 12 键形状）；未知 id → 404。"""
+    view = job_manager.get(job_id)
+    if view is None:
+        raise HTTPException(status_code=404,
+                            detail="job not found (可能因服务重启丢失)")
+    return view
+
+
+@app.delete("/jobs/{job_id}")
+async def cancel_job(job_id: str):
+    """取消任务（spec §4.3「已接受」语义）：返回请求后即时状态；
+    终态幂等返回当前态；未知 id → 404（与 GET 一致，评审 R4A 勘误）。"""
+    out = await job_manager.cancel(job_id)
+    if out is None:
+        raise HTTPException(status_code=404,
+                            detail="job not found (可能因服务重启丢失)")
+    return out
 
 
 class PauseRequest(BaseModel):
