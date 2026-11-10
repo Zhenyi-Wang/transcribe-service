@@ -32,6 +32,14 @@ def main():
         if path.name == "slow":
             path.write_text(str(os.getpid()))
             time.sleep(0.2)
+        if path.name == "stages":
+            # 阶段事件序列桩（tests/test_diar_stages.py）：decoded/stage×2/result
+            conn.send({"event": "decoded", "audio_duration": 8.0, "pcm_mb": 1.0})
+            conn.send({"event": "stage", "name": "segmenting"})
+            conn.send({"event": "stage", "name": "embedding"})
+            conn.send({"event": "result", "turns": [[0.0, 4.0, 0], [4.0, 8.0, 1]],
+                       "audio_duration": 8.0})
+            continue
         conn.send({"event": "result", "turns": [[0.0, 4.0, 0], [4.0, 8.0, 1]],
                    "audio_duration": 8.0})
 
@@ -59,7 +67,7 @@ def production_main():
         def _load(self):
             pass
 
-        def diarize(self, samples):
+        def diarize(self, samples, stage_cb=None):
             samples.path.write_text(str(os.getpid()))
             time.sleep(120)
             return []

@@ -7,7 +7,7 @@ import inspect
 
 
 def _fake_infer(fn):
-    async def infer(path, timeout):
+    async def infer(path, timeout, stage_cb=None):
         result = fn(path)
         return await result if inspect.isawaitable(result) else result
     return infer
