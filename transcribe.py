@@ -3,8 +3,11 @@ import os
 import math
 import copy
 import uuid
+import functools
 import asyncio
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from contextlib import contextmanager
 from config import config
@@ -42,6 +45,36 @@ def clamp_asr_context(context):
     n_ubatch = max(512, ((audio_frames + 500 + 511) // 512) * 512)
     budget = n_ubatch - audio_frames - 32
     return context[:budget]
+
+
+# ================= 执行控制句柄（entry）与取消传播 =================
+# ASR 调用专用线程池：暴露 concurrent Future（entry.thread_future）供取消方 join——
+# thread_future 完成前拥有者协程不得释放模型计数/音频租约/删除线程正在读的文件（spec §4.3）。
+# 边缘注记：遗留并发转录 >4 路时在专用池排队；单卡 + 后端串行锁下实际影响趋零（评审 R5A 知晓项）。
+_ASR_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="asr")
+
+# 分离忙（DiarizationBusyError）退避重试间隔；重试总期限由调用方 wait_deadline 决定。
+_DIARIZE_BUSY_RETRY_INTERVAL = 30.0
+
+
+class JobCancelledError(BaseException):
+    """任务取消：派生自 BaseException，穿透 `_process_transcription` 外层
+    `except Exception` → error dict 的既有转换，保证 job 终态为 cancelled 而非 error。"""
+
+
+def _cancel_probe_hit(entry, cancelled=None, result=None):
+    """取消探针：entry.cancel_flag / cancelled() 回调 / 后端报告的 chunk 级取消。
+
+    entry 为 None（直调无在途注册）时只看后两者。
+    """
+    if entry is not None and entry["cancel_flag"].is_set():
+        return True
+    if cancelled is not None and cancelled():
+        return True
+    performance = getattr(result, "performance", None)
+    if performance and performance.get("cancelled"):
+        return True
+    return False
 
 
 def get_audio_duration(file_path: str) -> float:
@@ -792,10 +825,13 @@ def _segment_by_punctuation(timestamps: list, text: str) -> list:
     return body if body else generate_subtitle_segments(text)
 
 
-async def _diarize_samples(audio_file_path: str, timeout: float):
-    """分离在独立进程解码/推理；超时和取消会真正回收进程及 ffmpeg。"""
+async def _diarize_samples(audio_file_path: str, timeout: float, stage_cb=None):
+    """分离在独立进程解码/推理；超时和取消会真正回收进程及 ffmpeg。
+
+    stage_cb(name)：五段阶段回调（spec §5 分离槽），原样透传 worker.run。
+    """
     from diarization.worker import get_worker
-    return await get_worker().run(audio_file_path, timeout)
+    return await get_worker().run(audio_file_path, timeout, stage_cb=stage_cb)
 
 
 def _diarize_timeout(audio_duration: float) -> float:
@@ -816,31 +852,49 @@ def _diarize_failure_cooldown(busy=False) -> float:
     return seconds
 
 
-async def _run_diarization(audio_file_path: str, audio_duration: float):
-    """共同降级边界，返回 turns/error/elapsed；取消不降级，必须上抛。"""
+async def _run_diarization(audio_file_path: str, audio_duration: float, wait_deadline: float = 0.0,
+                           stage_cb=None):
+    """共同降级边界，返回 turns/error/elapsed；取消不降级，必须上抛。
+
+    wait_deadline（time.monotonic() 绝对时刻）：DiarizationBusyError 时每
+    _DIARIZE_BUSY_RETRY_INTERVAL 秒重试至该期限，超期按既有降级返回；
+    0（默认）= 首次 busy 即降级，遗留行为不变。
+    deadline 上限钳制由调用方负责（队列侧为 10min，Task 3 传参时施加），本函数只按传入值执行。
+    stage_cb：五段阶段回调，原样透传 _diarize_samples → worker.run。
+    """
     start = time.monotonic()
     timeout = _diarize_timeout(audio_duration)
-    try:
-        turns = await asyncio.wait_for(_diarize_samples(audio_file_path, timeout), timeout)
-        return turns, None, time.monotonic() - start
-    except asyncio.TimeoutError:
-        logger.warning("说话人分离超时（>%.0fs），工作进程已回收", timeout)
-        return None, {"message": "diarization timeout"}, time.monotonic() - start
-    except Exception as e:
-        from diarization.worker import DiarizationBusyError
-        busy = isinstance(e, DiarizationBusyError)
-        if busy:
-            logger.info("分离工作器繁忙，短期冷却后只重试分离")
-        else:
-            logger.warning("说话人分离失败，本次降级", exc_info=True)
-        return None, {"message": f"diarization failed: {e}", "busy": busy}, time.monotonic() - start
+    while True:
+        try:
+            turns = await asyncio.wait_for(
+                _diarize_samples(audio_file_path, timeout, stage_cb=stage_cb), timeout)
+            return turns, None, time.monotonic() - start
+        except asyncio.TimeoutError:
+            logger.warning("说话人分离超时（>%.0fs），工作进程已回收", timeout)
+            return None, {"message": "diarization timeout"}, time.monotonic() - start
+        except Exception as e:
+            from diarization.worker import DiarizationBusyError
+            busy = isinstance(e, DiarizationBusyError)
+            if busy:
+                now = time.monotonic()
+                if now < wait_deadline:
+                    pause = min(_DIARIZE_BUSY_RETRY_INTERVAL, wait_deadline - now)
+                    logger.info("分离工作器繁忙，%.0f 秒后重试（距期限 %.0f 秒）", pause, wait_deadline - now)
+                    await asyncio.sleep(pause)
+                    continue
+                logger.info("分离工作器繁忙，短期冷却后只重试分离")
+            else:
+                logger.warning("说话人分离失败，本次降级", exc_info=True)
+            return None, {"message": f"diarization failed: {e}", "busy": busy}, time.monotonic() - start
 
 
-async def _diarize_turns_or_error(audio_file_path: str, video_id, download_time: float, total_start: float):
+async def _diarize_turns_or_error(audio_file_path: str, video_id, download_time: float, total_start: float,
+                                  wait_deadline: float = 0.0, stage_cb=None):
     """仅分离公共执行体（不跑 ASR）：返回 (turns, error, timing)，成功时 error 为 None。
 
     未启用/超时/失败时 turns 为 None 且 error 为 status=error 响应——
     仅分离模式的调用方需要显式失败信号来决定是否拼接，不做静默降级。
+    stage_cb：五段阶段回调，透传 _run_diarization。
     """
     timing = {"download": round(download_time, 3), "diarization": 0.0}
 
@@ -853,7 +907,8 @@ async def _diarize_turns_or_error(audio_file_path: str, video_id, download_time:
         return None, _err("diarization disabled"), timing
 
     audio_duration = await asyncio.to_thread(get_audio_duration, audio_file_path)
-    turns, error, elapsed = await _run_diarization(audio_file_path, audio_duration)
+    turns, error, elapsed = await _run_diarization(audio_file_path, audio_duration,
+                                                   wait_deadline=wait_deadline, stage_cb=stage_cb)
     timing["diarization"] = elapsed
     if error:
         return None, _err(error["message"]), timing
@@ -871,14 +926,19 @@ def _turns_speaker_summary(turns: list) -> list:
             for d in sorted(stat.values(), key=lambda x: x["id"])]
 
 
-async def diarize_only(audio_file_path: str, video_id: str = None, download_time: float = 0.0) -> dict:
+async def diarize_only(audio_file_path: str, video_id: str = None, download_time: float = 0.0,
+                       wait_deadline: float = 0.0, stage_cb=None) -> dict:
     """仅说话人分离（不跑 ASR）：返回说话人时间轴。
 
     单人也原样返回 turns（是否采用由调用方判断）。
     不涉及 ASR，不写转录缓存（音频下载缓存由下载层负责）。
+    wait_deadline：分离忙退避期限（time.monotonic()），0 = 遗留行为。
+    stage_cb：五段阶段回调（spec §5 分离槽），透传分离链。
     """
     total_start = time.time()
-    turns, error, timing = await _diarize_turns_or_error(audio_file_path, video_id, download_time, total_start)
+    turns, error, timing = await _diarize_turns_or_error(audio_file_path, video_id, download_time,
+                                                         total_start, wait_deadline=wait_deadline,
+                                                         stage_cb=stage_cb)
     if error:
         return error
 
@@ -894,7 +954,8 @@ async def diarize_only(audio_file_path: str, video_id: str = None, download_time
 
 
 async def diarize_merge_subtitle(body: list, audio_file_path: str, video_id: str = None,
-                                 download_time: float = 0.0) -> dict:
+                                 download_time: float = 0.0, wait_deadline: float = 0.0,
+                                 stage_cb=None) -> dict:
     """官方字幕说话人标注（不跑 ASR）：调用方（noteflow 自动字幕路径）把拉到的
     官方字幕 body 发来，分离后按时间重叠回填 speaker 返回。
 
@@ -902,9 +963,13 @@ async def diarize_merge_subtitle(body: list, audio_file_path: str, video_id: str
     否则 -1 = 跨界段，分组输出中延续当前组）。单人是"成功识别但无需标注"：
     status=success + annotated=false + body 原样返回；真正的失败（超时/异常/未启用）
     仍为 error。不写转录缓存。
+    wait_deadline：分离忙退避期限（time.monotonic()），0 = 遗留行为。
+    stage_cb：五段阶段回调（spec §5 分离槽），透传分离链。
     """
     total_start = time.time()
-    turns, error, timing = await _diarize_turns_or_error(audio_file_path, video_id, download_time, total_start)
+    turns, error, timing = await _diarize_turns_or_error(audio_file_path, video_id, download_time,
+                                                         total_start, wait_deadline=wait_deadline,
+                                                         stage_cb=stage_cb)
     if error:
         return error
 
@@ -958,7 +1023,18 @@ class TranscriptionService:
             if cache_args:
                 cache_manager.save_transcript_to_cache(transcript_data=response, diarize=True, **cache_args)
 
-    async def _annotate_cached_asr(self, cached, audio_file_path, cache_args):
+    async def _annotate_cached_asr(self, cached, audio_file_path, cache_args,
+                                   cancelled=None, wait_deadline=0.0, entry=None, stage_cb=None,
+                                   phase_cb=None):
+        """ASR 基线缓存命中路径：不跑 ASR，只补分离标注。
+
+        入口取消探针（第五形态：全程无 ASR，thread_future 恒空，探针是唯一中止点）；
+        wait_deadline 透传内部 _run_diarization——队列 diarize=true 缓存命中任务
+        在混用期遇分离忙不得直接降级（评审 R2A）。
+        phase_cb（fixwave F4）：成功返回前置位 formatting 阶段（spec §5）。
+        """
+        if _cancel_probe_hit(entry, cancelled):
+            raise JobCancelledError("cancelled before cached-ASR annotation")
         start = time.monotonic()
         response = copy.deepcopy(cached)
         raw_asr = response.pop("_asr", None)
@@ -966,7 +1042,8 @@ class TranscriptionService:
         if not math.isfinite(duration) or duration <= 0:
             duration = await asyncio.to_thread(get_audio_duration, audio_file_path)
             response["audio_duration"] = round(duration, 2)
-        turns, error, elapsed = await _run_diarization(audio_file_path, duration)
+        turns, error, elapsed = await _run_diarization(audio_file_path, duration,
+                                                       wait_deadline=wait_deadline, stage_cb=stage_cb)
         if turns is not None and len({t.speaker for t in turns}) > 1:
             if raw_asr and raw_asr.get("timestamps"):
                 response["body"] = generate_subtitle_segments_from_timestamps(
@@ -979,6 +1056,8 @@ class TranscriptionService:
         response.setdefault("timing", {}).update({"transcription": 0.0, "diarization": round(elapsed, 3),
                                                   "total": round(time.monotonic() - start, 3)})
         response["asr_cached"] = True
+        if phase_cb is not None:
+            phase_cb("formatting")   # 成功返回前置位（fixwave F4，spec §5）
         self._save_diarization_response(response, cache_args, error)
         return response
 
@@ -997,8 +1076,43 @@ class TranscriptionService:
         finally:
             lease.unlink(missing_ok=True)
 
+    def build_inflight_key(self, audio_file_path, audio_url=None, bvid=None, audio_id=None,
+                           file_path_for_cache=None, context=None, diarize=False, no_cache=False):
+        """组装完整 in-flight 键 `(loop, identity, context, diarize, no_cache)`。
+
+        JobManager 以与调用 process_transcription 完全相同的实参调用本函数即可
+        命中同一 entry（遗留先创建、job 后加入的场景由此共享控制句柄）。
+        """
+        context = clamp_asr_context(context)
+        cache_args = self._cache_args(audio_url, bvid, audio_id, file_path_for_cache, context)
+        identity = (cache_manager._get_cache_key(**cache_args, diarize=diarize)
+                    if cache_args else os.path.abspath(audio_file_path))
+        return (asyncio.get_running_loop(), identity, context, diarize, no_cache)
+
+    def cancel_computation(self, inflight_key, signal=True):
+        """条目级取消（spec §4.3）：置 entry.cancel_flag；signal=True 且已开始 ASR
+        时向后端发归属化取消（scoped cancel）。
+
+        signal=False（fixwave F1）：只置标志、跳过 backend.cancel_request——legacy
+        capability（引擎无 scoped /admin/cancel，其取消端点是全局语义）时不得发
+        scoped HTTP，否则会误杀他人共享同一旧引擎的转录；降级为「标志 + join
+        自然结束」（探针/收尾检查 flag 丢弃结果）。
+
+        返回 entry 供取消方 join thread_future（thread_future 完成前拥有者协程不会
+        收尾释放模型计数/租约/文件）；键未命中（计算已结束等）返回 None。
+        """
+        entry = self._inflight.get(inflight_key)
+        if entry is None:
+            return None
+        entry["cancel_flag"].set()
+        if signal and entry["asr_started"] and entry["backend"] is not None:
+            entry["backend"].cancel_request(entry["request_id"])
+        return entry
+
     async def _shared_transcription(self, audio_file_path, original_filename, audio_url,
-                                     bvid, audio_id, no_cache, file_path_for_cache, context, diarize):
+                                     bvid, audio_id, no_cache, file_path_for_cache, context, diarize,
+                                     progress_cb=None, cancelled=None, diarize_wait_deadline=0.0,
+                                     stage_cb=None, entry=None, phase_cb=None):
         job_id = uuid.uuid4().hex[:8]
         logger.info("转录任务开始: job=%s file=%s diarize=%s", job_id,
                     original_filename or audio_file_path, diarize)
@@ -1006,23 +1120,54 @@ class TranscriptionService:
             with self._audio_lease(audio_file_path) as leased_path:
                 return await self._process_transcription(
                     leased_path, original_filename or audio_file_path, audio_url, bvid, audio_id,
-                    no_cache, file_path_for_cache, context, diarize)
+                    no_cache, file_path_for_cache, context, diarize,
+                    progress_cb=progress_cb, cancelled=cancelled,
+                    diarize_wait_deadline=diarize_wait_deadline, stage_cb=stage_cb, entry=entry,
+                    phase_cb=phase_cb)
         finally:
             logger.info("转录任务结束: job=%s", job_id)
 
-    async def process_transcription(self, audio_file_path: str, original_filename: str = None, audio_url: str = None, bvid: str = None, audio_id: str = None, no_cache: bool = False, file_path_for_cache: str = None, context=None, diarize: bool = False):
-        """同参请求共享独立任务；取消单个请求不影响其他等待者，全部离开才回收。"""
+    async def process_transcription(self, audio_file_path: str, original_filename: str = None, audio_url: str = None, bvid: str = None, audio_id: str = None, no_cache: bool = False, file_path_for_cache: str = None, context=None, diarize: bool = False,
+                                    progress_cb=None, cancelled=None, diarize_wait_deadline: float = 0.0,
+                                    stage_cb=None, phase_cb=None):
+        """同参请求共享独立任务；取消单个请求不影响其他等待者，全部离开才回收。
+
+        队列侧新增参数（遗留端点不传 → 行为完全不变）：
+        - progress_cb: 透传 backend.transcribe，在转录线程内逐 chunk 调用
+          progress_cb(done, total)；**契约：在转录线程内调用、不得抛出异常**，由调用方保证。
+        - cancelled: Callable[[], bool] | None —— 队列取消探针，在 ASR 返回后与
+          字幕生成/缓存写入前检查，命中抛 JobCancelledError（BaseException）。
+        - diarize_wait_deadline: 分离忙（DiarizationBusyError）重试期限（time.monotonic()）；
+          0 = 首忙即降级（遗留行为）。
+        - stage_cb: 分离五段阶段回调 stage_cb(name)（decoding/segmenting/embedding/
+          clustering/reconstructing，spec §5 分离槽），透传 _run_diarization →
+          worker.run；在事件循环内调用、不得抛出异常（各层兜底吞异常）。与
+          progress_cb 同归属语义：仅创建共享计算的请求生效，后加入的请求不重挂。
+        - phase_cb: 本地 phase 驱动回调 phase_cb(name)（fixwave F4，spec §5）——
+          仅在字幕格式化入口与缓存命中标注路径的成功返回前调
+          phase_cb("formatting")；transcribing 由执行体在转录开始前置位，此处
+          不重复。遗留端点不传 → 全程不调，行为不变。
+        """
         context = clamp_asr_context(context)
-        cache_args = self._cache_args(audio_url, bvid, audio_id, file_path_for_cache, context)
-        identity = (cache_manager._get_cache_key(**cache_args, diarize=diarize)
-                    if cache_args else os.path.abspath(audio_file_path))
-        key = (asyncio.get_running_loop(), identity, context, diarize, no_cache)
+        key = self.build_inflight_key(audio_file_path, audio_url, bvid, audio_id,
+                                      file_path_for_cache, context, diarize, no_cache)
         entry = self._inflight.get(key)
         if entry is None:
+            # entry = 执行控制句柄（spec §4.3）：所有计算都经此创建，一律带全套控制信息
+            entry = {"task": None, "waiters": 0,
+                     "cancel_flag": threading.Event(),   # 创建即存在
+                     "request_id": uuid.uuid4().hex,     # 每次计算唯一，供后端归属化取消
+                     "thread_future": None,
+                     "asr_started": False,
+                     "backend": None,
+                     "inflight_key": key}
             task = asyncio.create_task(self._shared_transcription(
                 audio_file_path, original_filename, audio_url, bvid, audio_id,
-                no_cache, file_path_for_cache, context, diarize))
-            entry = {"task": task, "waiters": 0}
+                no_cache, file_path_for_cache, context, diarize,
+                progress_cb=progress_cb, cancelled=cancelled,
+                diarize_wait_deadline=diarize_wait_deadline, stage_cb=stage_cb, entry=entry,
+                phase_cb=phase_cb))
+            entry["task"] = task
             self._inflight[key] = entry
 
             def finished(done):
@@ -1033,7 +1178,7 @@ class TranscriptionService:
 
             task.add_done_callback(finished)
         else:
-            logger.info("合并重复的在途转录请求: %s", identity)
+            logger.info("合并重复的在途转录请求: %s", key[1])
         task = entry["task"]
         entry["waiters"] += 1
         try:
@@ -1049,7 +1194,9 @@ class TranscriptionService:
                 except BaseException:
                     pass
 
-    async def _process_transcription(self, audio_file_path: str, original_filename: str = None, audio_url: str = None, bvid: str = None, audio_id: str = None, no_cache: bool = False, file_path_for_cache: str = None, context=None, diarize: bool = False):
+    async def _process_transcription(self, audio_file_path: str, original_filename: str = None, audio_url: str = None, bvid: str = None, audio_id: str = None, no_cache: bool = False, file_path_for_cache: str = None, context=None, diarize: bool = False,
+                                     progress_cb=None, cancelled=None, diarize_wait_deadline: float = 0.0,
+                                     stage_cb=None, entry=None, phase_cb=None):
         """处理音频转录的主函数"""
         context = clamp_asr_context(context)  # 理论上限钳制（精确拟合由引擎守卫负责）
         diarize_enabled = bool(diarize and config.diarization_enabled)
@@ -1081,7 +1228,11 @@ class TranscriptionService:
             if diarize_enabled:
                 asr_cached = cache_manager.get_cached_transcript(diarize=False, include_asr=True, **cache_args)
                 if asr_cached:
-                    return await self._annotate_cached_asr(asr_cached, audio_file_path, cache_args)
+                    return await self._annotate_cached_asr(asr_cached, audio_file_path, cache_args,
+                                                           cancelled=cancelled,
+                                                           wait_deadline=diarize_wait_deadline,
+                                                           stage_cb=stage_cb, entry=entry,
+                                                           phase_cb=phase_cb)
         timing["cache_check"] = time.time() - cache_check_start
 
         try:
@@ -1120,11 +1271,28 @@ class TranscriptionService:
             logger.info(f"开始识别: {filename_to_log}")
 
             # 3. ASR 与分离并行；分离在可终止进程中，异常/取消都等待真正回收。
+            #    ASR 经专用线程池执行：thread_future 登记到 entry，取消方 join 完成后
+            #    拥有者才收尾释放（探针在 future 返回后才可能命中，天然保证该顺序）。
             transcription_start_time = time.time()
+            request_id = entry["request_id"] if entry is not None else uuid.uuid4().hex
+            if entry is not None:
+                # 提交前置位：cancel_computation 据此决定是否向 backend 发 cancel_request
+                entry["asr_started"] = True
+                entry["backend"] = backend
             if diarize_enabled:
-                diar_task = asyncio.create_task(_run_diarization(audio_file_path, audio_duration))
+                diar_task = asyncio.create_task(_run_diarization(
+                    audio_file_path, audio_duration, wait_deadline=diarize_wait_deadline,
+                    stage_cb=stage_cb))
                 try:
-                    result = await asyncio.to_thread(backend.transcribe, audio_file_path, None, context)
+                    cf = _ASR_EXECUTOR.submit(functools.partial(
+                        backend.transcribe, audio_file_path, None, context,
+                        progress_cb=progress_cb, request_id=request_id))
+                    if entry is not None:
+                        entry["thread_future"] = cf
+                    result = await asyncio.wrap_future(cf)
+                    # 取消探针①：executor future 返回后、await diar_task 前
+                    if _cancel_probe_hit(entry, cancelled, result):
+                        raise JobCancelledError("cancelled after transcription")
                     processing_time = time.time() - transcription_start_time
                     turns, diarization_error, diar_elapsed = await diar_task
                 except BaseException:
@@ -1136,7 +1304,15 @@ class TranscriptionService:
                     raise
                 timing["diarization"] = diar_elapsed
             else:
-                result = await asyncio.to_thread(backend.transcribe, audio_file_path, None, context)
+                cf = _ASR_EXECUTOR.submit(functools.partial(
+                    backend.transcribe, audio_file_path, None, context,
+                    progress_cb=progress_cb, request_id=request_id))
+                if entry is not None:
+                    entry["thread_future"] = cf
+                result = await asyncio.wrap_future(cf)
+                # 取消探针①：executor future 返回后
+                if _cancel_probe_hit(entry, cancelled, result):
+                    raise JobCancelledError("cancelled after transcription")
                 processing_time = time.time() - transcription_start_time
             timing["transcription"] = processing_time
 
@@ -1172,7 +1348,15 @@ class TranscriptionService:
 
             logger.info(f"检测到语言: {detected_lang}")
 
-            # 4. 生成字幕格式
+            # 取消探针②：字幕生成/缓存写入前——await diar_task 期间到达的取消在此中止，
+            # 部分结果绝不入缓存、不作为成功响应返回。
+            if _cancel_probe_hit(entry, cancelled, result):
+                raise JobCancelledError("cancelled before formatting")
+
+            # 4. 生成字幕格式（spec §5 formatting 阶段：进入格式化即前置位；
+            # transcribing 由执行体在转录开始前置位，此处不重复——fixwave F4）
+            if phase_cb is not None:
+                phase_cb("formatting")
             subtitle_start = time.time()
             if timestamps:
                 subtitle_body = generate_subtitle_segments_from_timestamps(

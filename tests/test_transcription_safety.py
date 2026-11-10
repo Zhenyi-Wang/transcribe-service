@@ -18,7 +18,7 @@ class CountingBackend:
     def __init__(self):
         self.calls = 0
 
-    def transcribe(self, path, lang=None, context=None):
+    def transcribe(self, path, lang=None, context=None, progress_cb=None, request_id=None):
         self.calls += 1
         return TranscribeResult(
             text="甲说乙说", language="zh",
@@ -53,7 +53,7 @@ async def test_failure_cools_down_and_keeps_completed_asr(env, monkeypatch):
     service, backend, path = env
     calls = []
 
-    def fail(audio_path, timeout=None):
+    def fail(audio_path, timeout=None, stage_cb=None):
         calls.append(audio_path)
         raise RuntimeError("temporary diarization error")
 
@@ -72,7 +72,7 @@ async def test_failure_cools_down_and_keeps_completed_asr(env, monkeypatch):
 async def test_after_cooldown_retries_only_diarization(env, monkeypatch):
     service, backend, path = env
 
-    async def fail(audio_path, timeout):
+    async def fail(audio_path, timeout, stage_cb=None):
         raise RuntimeError("try later")
 
     monkeypatch.setattr(T, "_diarize_samples", fail)
@@ -85,7 +85,7 @@ async def test_after_cooldown_retries_only_diarization(env, monkeypatch):
     fallback_path.unlink()
     calls = []
 
-    async def recovered(audio_path, timeout):
+    async def recovered(audio_path, timeout, stage_cb=None):
         calls.append(audio_path)
         return [SpeakerTurn(0.0, 3.1, 0), SpeakerTurn(4.0, 8.0, 1)]
 
@@ -104,7 +104,7 @@ async def test_duplicate_inflight_requests_share_work_not_response_objects(env, 
     started, release = asyncio.Event(), asyncio.Event()
     calls = []
 
-    async def infer(audio_path, timeout):
+    async def infer(audio_path, timeout, stage_cb=None):
         calls.append(audio_path)
         started.set()
         await release.wait()
@@ -128,7 +128,7 @@ async def test_cancelled_duplicate_does_not_cancel_owner(env, monkeypatch):
     service, backend, path = env
     started, release = asyncio.Event(), asyncio.Event()
 
-    async def infer(audio_path, timeout):
+    async def infer(audio_path, timeout, stage_cb=None):
         started.set()
         await release.wait()
         return [SpeakerTurn(0.0, 8.0, 0)]
@@ -151,7 +151,7 @@ async def test_asr_failure_cancels_and_awaits_diarization_cleanup(env, monkeypat
     service, backend, path = env
     started, cleaned = asyncio.Event(), asyncio.Event()
 
-    async def infer(audio_path, timeout):
+    async def infer(audio_path, timeout, stage_cb=None):
         started.set()
         try:
             await asyncio.Event().wait()
@@ -173,7 +173,7 @@ async def test_cancelled_owner_does_not_cancel_remaining_follower(env, monkeypat
     service, backend, path = env
     started, release = asyncio.Event(), asyncio.Event()
 
-    async def infer(audio_path, timeout):
+    async def infer(audio_path, timeout, stage_cb=None):
         started.set()
         await release.wait()
         return [SpeakerTurn(0.0, 8.0, 0)]
@@ -201,7 +201,7 @@ async def test_shared_job_keeps_upload_alive_after_owner_cleanup(env, tmp_path, 
     upload.write_bytes(b"fake-audio")
     started, release = asyncio.Event(), asyncio.Event()
 
-    async def infer(audio_path, timeout):
+    async def infer(audio_path, timeout, stage_cb=None):
         started.set()
         await release.wait()
         assert Path(audio_path).read_bytes() == b"fake-audio"
@@ -227,7 +227,7 @@ async def test_last_waiter_cancellation_stops_shared_job(env, monkeypatch):
     service, backend, path = env
     started, cleaned = asyncio.Event(), asyncio.Event()
 
-    async def infer(audio_path, timeout):
+    async def infer(audio_path, timeout, stage_cb=None):
         started.set()
         try:
             await asyncio.Event().wait()
@@ -250,7 +250,7 @@ async def test_busy_failure_uses_short_cooldown_not_one_hour(env, monkeypatch):
     from diarization.worker import DiarizationBusyError
     service, backend, path = env
 
-    async def busy(audio_path, timeout):
+    async def busy(audio_path, timeout, stage_cb=None):
         raise DiarizationBusyError("busy")
 
     monkeypatch.setattr(T, "_diarize_samples", busy)
@@ -267,7 +267,7 @@ async def test_new_caller_does_not_join_a_cancelled_job_during_cleanup(env, monk
     started, cleaning, finish_cleanup = asyncio.Event(), asyncio.Event(), asyncio.Event()
     calls = []
 
-    async def infer(audio_path, timeout):
+    async def infer(audio_path, timeout, stage_cb=None):
         calls.append(audio_path)
         if len(calls) == 1:
             started.set()
@@ -290,6 +290,47 @@ async def test_new_caller_does_not_join_a_cancelled_job_during_cleanup(env, monk
         await old
     assert (await new)["status"] == "success"
     assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_phase_cb_called_at_formatting_entries(env, monkeypatch):
+    """fixwave F4（spec §5）：phase_cb("formatting") 只在两个格式化入口调用——
+    ① 字幕生成入口（转录开始不重复置 transcribing，由执行体负责）；
+    ② ASR 基线缓存命中路径（_annotate_cached_asr）成功返回前。
+    不传 phase_cb（遗留端点）→ 全程不调，行为不变。"""
+    service, backend, path = env
+
+    # ① 正常转录：formatting 恰一次
+    phases = []
+    await service.process_transcription(path, file_path_for_cache=path,
+                                        phase_cb=phases.append)
+    assert phases == ["formatting"]
+
+    # 不传 phase_cb：不调（遗留端点行为不变）
+    await service.process_transcription(path, file_path_for_cache=path, no_cache=True)
+    assert phases == ["formatting"]
+
+    # ② ASR 基线缓存命中 → _annotate_cached_asr 成功返回前置位
+    async def infer(audio_path, timeout, stage_cb=None):
+        return [SpeakerTurn(0.0, 8.0, 0)]
+
+    monkeypatch.setattr(T, "_diarize_samples", infer)
+    calls_before = backend.calls
+    phases2 = []
+    second = await service.process_transcription(path, file_path_for_cache=path,
+                                                 diarize=True, phase_cb=phases2.append)
+    assert second["status"] == "success"
+    assert backend.calls == calls_before, "基线缓存命中不重复 ASR"
+    assert phases2 == ["formatting"]
+
+    # 取消命中时不前置位（探针中止早于格式化入口；no_cache 绕开缓存命中）
+    phases3 = []
+    with pytest.raises(T.JobCancelledError):
+        await asyncio.wait_for(
+            service.process_transcription(path, no_cache=True,
+                                          cancelled=lambda: True,
+                                          phase_cb=phases3.append), 5)
+    assert phases3 == [], "取消探针命中早于 formatting 前置位"
 
 
 

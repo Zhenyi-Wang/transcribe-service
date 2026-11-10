@@ -12,7 +12,7 @@ class FakeBackend:
     name = "fake"
     device = "cpu"
 
-    def transcribe(self, path, lang=None, context=None):
+    def transcribe(self, path, lang=None, context=None, progress_cb=None, request_id=None):
         chars = "甲乙甲乙二人对话内容持续输出一直到十六字整"  # 21 字（断言不依赖字数）
         return TranscribeResult(
             text=chars,
@@ -30,7 +30,7 @@ def _make_service():
 
 
 def _fake_infer(fn):
-    async def infer(path, timeout):
+    async def infer(path, timeout, stage_cb=None):
         result = fn(path)
         return await result if inspect.isawaitable(result) else result
     return infer
