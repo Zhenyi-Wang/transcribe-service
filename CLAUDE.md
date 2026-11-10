@@ -37,13 +37,15 @@ curl -X POST "http://localhost:31080/transcribe" -F "file=@test/test.mp3" -H "Au
 
 | 后端 | name | 说明 | 时间戳精度 |
 |------|------|------|-----------|
-| GGUF | `gguf` | llama.cpp + ONNX encoder，量化推理 | 字级 (ForcedAligner) |
+| GGUF | `gguf` | 兼容路径：llama.cpp + ONNX encoder，量化推理 | 字级 (ForcedAligner) |
 | Qwen3-ASR | `qwen3-asr` | HuggingFace transformers + flash_attention_2 | 字级 (ForcedAligner) |
 | FunASR | `funasr` | 阿里 FunASR Paraformer + VAD + 标点 | 句级 |
 
+**生产基线为 `asr-engine` 后端；`gguf` 为兼容路径（仅测试/回退）。**
+
 `BackendFactory.create(config)` 返回 `ASRBackend` 实例，统一接口：`load()` / `unload()` / `transcribe(file, lang?) → TranscribeResult`。
 
-GGUF 后端在 `backends/gguf_backend.py` 之上还有 `qwen_asr_gguf/` 包（ONNX encoder + llama.cpp decoder + ForcedAligner 实现）。
+`gguf` 为兼容路径（仅测试/回退用），生产基线为 `asr-engine`。GGUF 后端在 `backends/gguf_backend.py` 之上还有 `qwen_asr_gguf/` 包（ONNX encoder + llama.cpp decoder + ForcedAligner 实现）。
 
 ### 关键类
 
@@ -94,6 +96,7 @@ backend:
 | `POST /transcribe` | 上传音频文件转录 |
 | `POST /transcribe_url` | B站视频转录（BV号 + cookie） |
 | `POST /transcribe_file` | 网盘文件转录（路径相对 webdav.base_path）；**转录成功后自动归档 inbox→processed**（webdav_archive.py，失败静默记日志，见 docs/2026-11-02） |
+| `POST /jobs` 等六个端点 | 任务队列（POST /jobs 提交、/jobs/query 批量轮询、GET /jobs/{id} 查询、DELETE 取消；详见 docs/2026-11-10_transcribe-job-queue.md） |
 
 ## Environment
 
@@ -110,3 +113,4 @@ backend:
 - [diarization ONNX Conv Fallback 警告与提速](docs/2026-10-09_diarization-onnx-conv-fallback.md) — pyannote 硬编码 DEFAULT，短样本中较慢且刷警告；2026-10-10 勘误：FALLBACK 是 cuDNN 计划策略，不等于 CPU 回退；当前可配置 DEFAULT/HEURISTIC/EXHAUSTIVE，默认保持原策略
 - [WSL 提交内存压力与分离资源保护](docs/2026-10-10_wsl-commit-pressure-diarization-safety.md) — commit/物理内存与真实 .wslconfig 核验；分离独立进程回收、聚类/重建/RSS 边界、在途去重、ASR 与失败冷却缓存；短音频验证通过，事故底层分配仍未定案
 - [reconstruct 分块重写](docs/2026-10-10_reconstruct-chunked-rewrite.md) — 512MB 预算拒 2.5h/8人任务的根因与上游调查(#962/#1819/#1963)；分块 reconstruct 峰值与时长解耦（652MB→103MB）且与上游 bitwise 等价；reconstruction_batch_chunks=256；已上线并真实验证（同音频 8人/2545turns/2438段全标注）
+- [转录任务队列与进度轮询](docs/2026-11-10_transcribe-job-queue.md) — /jobs 异步任务入口、分槽进度、六形态取消矩阵；noteflow 两段式对接契约（2026-11-10）
