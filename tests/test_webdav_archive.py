@@ -35,6 +35,22 @@ def test_idempotent_skip_when_source_gone(webdav):
     assert move_to_processed(webdav, "inbox/youtube/ch/gone.mp3") is False
 
 
+def test_skip_when_path_already_processed(webdav):
+    # 回退读取场景：relative_path 已被改写为 processed/...，
+    # 归档必须跳过，不得把文件移进 processed/processed 嵌套目录
+    write(webdav, "processed/youtube/ch/a.mp3")
+    assert move_to_processed(webdav, "processed/youtube/ch/a.mp3") is False
+    assert os.path.isfile(os.path.join(webdav, "processed/youtube/ch/a.mp3"))
+    assert not os.path.exists(os.path.join(webdav, "processed/processed"))
+
+
+def test_skip_processed_with_leading_slash(webdav):
+    # 防御：绝对路径形式传入时同样按终态处理
+    write(webdav, "processed/youtube/ch/a.mp3")
+    assert move_to_processed(webdav, "/processed/youtube/ch/a.mp3") is False
+    assert not os.path.exists(os.path.join(webdav, "processed/processed"))
+
+
 def test_avoid_overwrite_renames_existing(webdav):
     write(webdav, "inbox/youtube/ch/a.mp3", "new")
     write(webdav, "processed/youtube/ch/a.mp3", "old")

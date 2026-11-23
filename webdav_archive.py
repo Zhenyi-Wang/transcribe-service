@@ -10,11 +10,12 @@
 - 伴移：同名字幕（.srt/.vtt/.ass/.ssa/.lrc）与同目录 metadata.json
 - 源目录移空后删除该目录（不递归）
 """
-import logging
 import os
 import shutil
 
-logger = logging.getLogger(__name__)
+from logger_config import setup_logger
+
+logger = setup_logger("webdav_archive")
 
 COMPANION_EXTS = ("srt", "vtt", "ass", "ssa", "lrc")
 
@@ -44,6 +45,14 @@ def move_to_processed(webdav_base: str, relative_path: str) -> bool:
     任何失败都只记日志并返回 False，不抛出（归档失败不应影响转录结果）。
     """
     try:
+        # 终态守卫：processed 是归档区终态。回退读取（inbox 不在时改读 processed）
+        # 成功后 relative_path 已是 processed/...，此时文件已在归档区，
+        # 绝不能再移动——否则会在 processed 下再套一层 processed（2026-11-23 事故根因）
+        rel = relative_path.lstrip("/")
+        if rel == "processed" or rel.startswith("processed/"):
+            logger.info(f"归档跳过（已是 processed 终态）: {relative_path}")
+            return False
+
         src = os.path.join(webdav_base, relative_path)
         if not os.path.isfile(src):
             # 源不在 inbox：已被移走或经 processed 回退读取，幂等跳过
