@@ -26,6 +26,7 @@ from pause_manager import PauseManager, MAX_PAUSE_HOURS
 from diarization import worker as diarization_mgr
 from jobs import JobManager, QueueFullError
 import webdav_archive
+import bili_cookie_manager
 from pydantic import BaseModel, Field
 
 # 设置 HuggingFace 缓存目录和日志
@@ -310,6 +311,10 @@ async def _exec_bilibili(job, sinks, req):
     DownloadCancelled → 清 .part → 上抛（终态 cancelled 由 JobManager 映射）。"""
     video_id = req.get("bvid") or ""
     cookie = req.get("cookie") or ""
+    if not cookie:
+        # 2026-11-24：Cookie 不再随 /jobs 载荷传递（jobs.py 剥离 + 此处改读本地
+        # 副本）；载荷字段仅作旧调用兼容，通常为空
+        cookie = bili_cookie_manager.load_cookie()
     page = int(req.get("page") or 1)
     context = req.get("context")
     diarize = bool(req.get("diarize"))
@@ -318,10 +323,21 @@ async def _exec_bilibili(job, sinks, req):
 
     sinks["phase"]("downloading")
     download_start = time.time()
+    fail_note = ""
     try:
         success, dl = await asyncio.to_thread(
             downloader.download_bilibili_audio, video_id, cookie, save_dir, page,
             progress_cb=sinks["progress"], cancel_flag=sinks["cancel_event"])
+        if not success:
+            # 登录态自愈：nav 探测区分登录类/风控类，同步或触发刷新后重试一次。
+            # 返回 cookie 为空 = 自愈被禁用（测试桩），保持原有失败语义
+            cookie, fail_note = bili_cookie_manager.ensure_fresh_cookie(video_id)
+            if cookie:
+                logger.info(f"B 站下载失败后登录态自愈（{video_id}）: {fail_note}，重试一次")
+                success, dl = await asyncio.to_thread(
+                    downloader.download_bilibili_audio, video_id, cookie,
+                    save_dir, page,
+                    progress_cb=sinks["progress"], cancel_flag=sinks["cancel_event"])
     except DownloadCancelled:
         _cleanup_part_files(video_id, save_dir)
         raise
@@ -329,7 +345,8 @@ async def _exec_bilibili(job, sinks, req):
     sinks["note_download_time"](download_time)
 
     if not success:
-        return _job_error_dict(f"音频下载失败: {dl}")
+        note = f"（{fail_note}）" if fail_note else ""
+        return _job_error_dict(f"音频下载失败: {dl}{note}")
 
     temp_filename = dl["file_path"]
     try:
@@ -707,6 +724,13 @@ async def startup_event():
     await job_manager.start()
     _jobs_bg_tasks.append(asyncio.create_task(_upstream_pause_refresh_loop()))
     _jobs_bg_tasks.append(asyncio.create_task(_warm_capability_once()))
+    # B 站 Cookie 本地副本：缺失即同步一次；每日探测登录态（2026-11-24）
+    try:
+        if not bili_cookie_manager.load_cookie():
+            bili_cookie_manager.sync_from_production()
+    except Exception as e:
+        logger.warning(f"启动同步 B 站 Cookie 失败（不阻断启动）: {e}")
+    _jobs_bg_tasks.append(asyncio.create_task(bili_cookie_manager.bili_cookie_probe_loop()))
     if pause_manager.is_paused():
         logger.info(f"启动时处于暂停状态(至 {_fmt_resume_at(pause_manager.resume_at())})，跳过预加载")
         return
@@ -1018,10 +1042,11 @@ async def transcribe_douyin_audio(request: DouyinTranscribeRequest):
 # ================= /jobs 异步任务端点（spec §4 API 契约） =================
 
 class JobBilibiliSubmit(BaseModel):
-    """字段校验与 BilibiliTranscribeRequest 同构 + 判别标签 + 可选 job_id"""
+    """字段校验与 BilibiliTranscribeRequest 同构 + 判别标签 + 可选 job_id。
+    cookie 不随载荷传递（2026-11-24，/jobs 丢 Cookie 缺陷根治）：执行器从
+    本地副本读取（bili_cookie_manager），生产真值在 NoteFlowConfig。"""
     source: Literal["bilibili"]
     bvid: str
-    cookie: str
     page: int = 1
     context: Optional[str] = None  # ASR 偏置文本，可选
     diarize: bool = False

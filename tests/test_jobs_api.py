@@ -26,6 +26,7 @@ spec：docs/superpowers/specs/2026-11-10-transcribe-job-queue-design.md
     归档提交点（归档开始后取消到达 → done 胜出取消，文件已归档、result 一致）
 """
 import asyncio
+import json
 import os
 import threading
 import time
@@ -195,6 +196,76 @@ class SimpleNS:
         self.__dict__.update(kw)
 
 
+# ---------- 17. Cookie 本地持有（2026-11-24 /jobs 停传 Cookie）----------
+
+def test_bilibili_loads_local_cookie(api, monkeypatch):
+    """载荷不再携带 Cookie：执行器应从本地副本加载（回归 /jobs 丢 Cookie 缺陷）。"""
+    captured = []
+
+    def cap_download(video_id, cookie, save_dir="tmp", page=1,
+                     progress_cb=None, cancel_flag=None):
+        captured.append(cookie)
+        f = Path(api.tmp_path) / f"{video_id}_p{page}_audio.m4a"
+        f.write_bytes(b"RIFF")
+        return True, {"file_path": str(f), "audio_url": "https://example/a",
+                      "audio_id": "42"}
+
+    monkeypatch.setattr(server.downloader, "download_bilibili_audio", cap_download)
+    monkeypatch.setattr(server.bili_cookie_manager, "load_cookie",
+                        lambda: "LOCAL_CK")
+    r = submit_json(api.client, {"source": "bilibili", "bvid": "BVlocalck"})
+    assert r.status_code == 202
+    body = wait_terminal(api.client, r.json()["job_id"])
+    assert body["status"] == "done"
+    assert captured == ["LOCAL_CK"]
+
+
+def test_bilibili_self_heal_retries_with_refreshed_cookie(api, monkeypatch):
+    """下载失败 → 自愈产出新 Cookie → 自动重试一次并成功。"""
+    calls_ = []
+    state = {"n": 0}
+
+    def flaky_download(video_id, cookie, save_dir="tmp", page=1,
+                       progress_cb=None, cancel_flag=None):
+        calls_.append(cookie)
+        state["n"] += 1
+        if state["n"] == 1:
+            return False, "无法在页面中找到 __playinfo__ 数据"
+        f = Path(api.tmp_path) / f"{video_id}_audio.m4a"
+        f.write_bytes(b"RIFF")
+        return True, {"file_path": str(f), "audio_url": "https://example/a",
+                      "audio_id": "42"}
+
+    monkeypatch.setattr(server.downloader, "download_bilibili_audio", flaky_download)
+    monkeypatch.setattr(server.bili_cookie_manager, "load_cookie", lambda: "")
+    monkeypatch.setattr(server.bili_cookie_manager, "ensure_fresh_cookie",
+                        lambda *a, **k: ("FRESH_CK", "已从生产同步新 cookie"))
+    r = submit_json(api.client, {"source": "bilibili", "bvid": "BVheal"})
+    body = wait_terminal(api.client, r.json()["job_id"])
+    assert body["status"] == "done"
+    assert calls_ == ["", "FRESH_CK"]
+
+
+def test_bilibili_self_heal_disabled_keeps_failure_semantics(api, monkeypatch):
+    """自愈不可用（返回空 cookie）时保持原有失败语义：单次尝试、错误落终态。"""
+    calls_ = []
+
+    def always_fail(video_id, cookie, save_dir="tmp", page=1,
+                    progress_cb=None, cancel_flag=None):
+        calls_.append(cookie)
+        return False, "no playinfo"
+
+    monkeypatch.setattr(server.downloader, "download_bilibili_audio", always_fail)
+    monkeypatch.setattr(server.bili_cookie_manager, "load_cookie", lambda: "")
+    monkeypatch.setattr(server.bili_cookie_manager, "ensure_fresh_cookie",
+                        lambda *a, **k: (None, ""))
+    r = submit_json(api.client, {"source": "bilibili", "bvid": "BVdead"})
+    body = wait_terminal(api.client, r.json()["job_id"])
+    assert body["status"] == "error"
+    assert len(calls_) == 1
+    assert "音频下载失败" in (body.get("result") or {}).get("message", "")
+
+
 def wait_terminal(client, job_id, timeout=15.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -225,7 +296,7 @@ def submit_json(client, payload):
 def test_four_sources_full_chain(api):
     c, t0 = api.client, time.monotonic()
 
-    r = submit_json(c, {"source": "bilibili", "bvid": "BV1abc", "cookie": "SESSDATA=xyz",
+    r = submit_json(c, {"source": "bilibili", "bvid": "BV1abc",
                         "page": 2, "context": None, "diarize": True,
                         "diarize_only": False, "body": None, "no_cache": False})
     assert r.status_code == 202
@@ -287,7 +358,7 @@ def test_four_sources_full_chain(api):
 
 def test_bilibili_diarize_only_phase_and_deadline(api):
     c = api.client
-    r = submit_json(c, {"source": "bilibili", "bvid": "BVdio", "cookie": "ck",
+    r = submit_json(c, {"source": "bilibili", "bvid": "BVdio",
                         "diarize_only": True})
     assert r.status_code == 202
     done = wait_terminal(c, r.json()["job_id"])
@@ -303,7 +374,7 @@ def test_bilibili_diarize_only_phase_and_deadline(api):
 def test_bilibili_diarize_only_with_body_uses_merge(api):
     c = api.client
     body = [{"text": "句一"}]
-    r = submit_json(c, {"source": "bilibili", "bvid": "BVmerge", "cookie": "ck",
+    r = submit_json(c, {"source": "bilibili", "bvid": "BVmerge",
                         "diarize_only": True, "body": body})
     assert r.status_code == 202
     done = wait_terminal(c, r.json()["job_id"])
@@ -326,16 +397,16 @@ def test_submit_validation_422(api):
     c = api.client
     # job_id 格式不合法 → JobManager ValueError → 422
     for bad in ("bad id!", "a" * 129, "with#hash", ".", ".."):
-        r = submit_json(c, {"source": "bilibili", "bvid": "BV1", "cookie": "ck",
+        r = submit_json(c, {"source": "bilibili", "bvid": "BV1",
                             "job_id": bad})
         assert r.status_code == 422, (bad, r.status_code)
     # Pydantic 字段错 → 422
-    assert submit_json(c, {"source": "bilibili", "bvid": "BV1"}).status_code == 422       # 缺 cookie
+    pass  # cookie 已不再随载荷传递（2026-11-24），缺 cookie 是合法提交
     assert submit_json(c, {"source": "douyin", "aweme_id": "abc"}).status_code == 422     # 格式错
     assert submit_json(c, {"source": "nope"}).status_code == 422                          # 未知 source
     assert submit_json(c, {"source": "webdav"}).status_code == 422                        # 缺 path
     # 合法 job_id 形状可提交（隔离字母数字）
-    r = submit_json(c, {"source": "bilibili", "bvid": "BVok", "cookie": "ck",
+    r = submit_json(c, {"source": "bilibili", "bvid": "BVok",
                         "job_id": "cuid123-1"})
     assert r.status_code == 202
     assert wait_terminal(c, r.json()["job_id"])["status"] == "done"
@@ -356,7 +427,7 @@ def test_paused_submit_503(api):
     c = api.client
     assert c.post("/pause", json={"hours": 1}, headers=_h()).status_code == 200
     # 两个提交端点均 503（POST 才拦）
-    r = submit_json(c, {"source": "bilibili", "bvid": "BV1", "cookie": "ck"})
+    r = submit_json(c, {"source": "bilibili", "bvid": "BV1"})
     assert r.status_code == 503
     assert r.json()["paused"] is True and r.json()["resume_at"]
     r = c.post("/jobs/upload", files={"file": ("a.wav", b"RIFF", "audio/wav")},
@@ -367,7 +438,7 @@ def test_paused_submit_503(api):
     # 恢复后提交恢复
     assert c.post("/resume", headers=_h()).status_code == 200
     assert submit_json(c, {"source": "bilibili", "bvid": "BVresume",
-                           "cookie": "ck"}).status_code == 202
+                           }).status_code == 202
 
 
 # ---------- 5. query 命中 / missing / >500 截断 ----------
@@ -437,7 +508,7 @@ def test_list_cap_and_cookie_not_echoed(api):
 def test_delete_three_states(api):
     c, state = api.client, api.state
     state["mode"] = "block"
-    r1 = submit_json(c, {"source": "bilibili", "bvid": "BVrun", "cookie": "ck"})
+    r1 = submit_json(c, {"source": "bilibili", "bvid": "BVrun"})
     j1 = r1.json()["job_id"]
     wait_running(c, j1)
     r2 = submit_json(c, {"source": "bilibili", "bvid": "BVqueued", "cookie": "ck"})
@@ -510,7 +581,7 @@ def test_queue_full_429_header_and_body(api):
     wait_terminal(c, r1.json()["job_id"])
     # 腾出后可再次提交
     assert submit_json(c, {"source": "bilibili", "bvid": "BVq3",
-                           "cookie": "ck"}).status_code == 202
+                           }).status_code == 202
 
 
 # ---------- 12. cleanup protected 行为 ----------

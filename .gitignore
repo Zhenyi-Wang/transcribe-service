@@ -148,3 +148,7 @@ lib.bak-*/
 
 # 暂停状态文件(运行时产物)
 pause_state.json
+
+# B 站 Cookie 本地副本与刷新防抖标记（凭据，绝不入库）
+bili_cookie.local
+bili_refresh.last
